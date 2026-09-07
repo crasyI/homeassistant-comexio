@@ -20,6 +20,7 @@ from .const import (
     CONF_USERNAME,
     DOMAIN,
     MarkerKind,
+    webio_range_check_entity_id,
 )
 from .coordinator import ComexioCoordinator
 from .services import async_setup_services
@@ -305,7 +306,7 @@ def _migrate_webio_range_check_entity_id(hass: HomeAssistant, server_id: str) ->
     ent_reg = er.async_get(hass)
     unique_id = f"comexio_{server_id}_webio_range_check_btn"
     old_entity_id = ent_reg.async_get_entity_id("button", DOMAIN, unique_id)
-    target_entity_id = f"button.comexio_{server_id}_webio_range_check"
+    target_entity_id = webio_range_check_entity_id(server_id)
     if not old_entity_id or old_entity_id == target_entity_id:
         return
     if ent_reg.async_get(target_entity_id) is not None:

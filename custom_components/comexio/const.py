@@ -2,6 +2,8 @@ from collections.abc import Iterator
 from enum import StrEnum
 import re
 
+from homeassistant.util import slugify
+
 # Version: 0.8.1
 DOMAIN = "comexio"
 
@@ -229,6 +231,16 @@ def fw_update_signal(server_id: str) -> str:
 # simultaneously.
 WEBIO_RANGE_CHECK_HOUR = 4
 WEBIO_RANGE_CHECK_MINUTE = 20
+
+
+def webio_range_check_entity_id(server_id: str) -> str:
+    """Entity ID of the Web-IO range-check button — slugified so hyphens etc. in server_id stay valid.
+
+    Used both at platform setup (button.py) and by the one-time migration that repoints
+    any pre-existing registration built from the old, unslugified formula (__init__.py).
+    """
+    return f"button.comexio_{slugify(server_id)}_webio_range_check"
+
 
 # Result dict keys shared between coordinator._async_webio_range_check_tick and the
 # range-check button's notification — extracted so both sides can't drift apart on a typo.
