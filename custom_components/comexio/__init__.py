@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
+from homeassistant.util import slugify
 
 from .api import ComexioAPI
 from .const import (
@@ -368,7 +369,7 @@ async def _async_fix_statistics_units(hass: HomeAssistant, server_id: str) -> No
         _LOGGER.debug("[%s] Statistics unit fix skipped: recorder unavailable", server_id)
         return
 
-    server_slug = server_id.lower()
+    server_slug = slugify(server_id)
     prefixes = (
         f"sensor.comexio_{server_slug}_",
         f"sensor.comexio_server_{server_slug}_",

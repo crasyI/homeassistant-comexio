@@ -17,7 +17,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later, async_track_time_change, async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util import dt as dt_util
+from homeassistant.util import dt as dt_util, slugify
 
 from .api import ComexioAPI
 from .const import (
@@ -2328,7 +2328,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         from homeassistant.helpers import entity_registry as er
 
         ent_reg = er.async_get(self.hass)
-        server_slug = self.server_id.lower()
+        server_slug = slugify(self.server_id)
         double_prefix = f"comexio_{server_slug}_{server_slug}_"
         single_prefix = f"comexio_{server_slug}_"
 
@@ -2515,7 +2515,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return []
 
         ent_reg = er.async_get(self.hass)
-        server_slug = self.server_id.lower()
+        server_slug = slugify(self.server_id)
         # Match all historical naming patterns for this server_id:
         # - current:  sensor.comexio_{server_id}_...
         # - legacy:   sensor.comexio_server_{server_id}_...  (pre-sub-device-grouping naming)

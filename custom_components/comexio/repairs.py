@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er, issue_registry as ir
 from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig, SelectSelectorMode
+from homeassistant.util import slugify
 import voluptuous as vol
 
 from .const import (
@@ -304,7 +305,7 @@ class ComexioRepairFlow(RepairsFlow):
 
             # Prepare service call for the sync action
             service_data = {
-                "entity_id": btn_entity_id or f"button.comexio_{server_id}_webio_sync_start",
+                "entity_id": btn_entity_id or f"button.comexio_{slugify(server_id)}_webio_sync_start",
                 "action": action,
             }
 
