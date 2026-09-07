@@ -253,7 +253,7 @@ class ComexioAPI:
         session = async_create_clientsession(self.hass, **self._build_session_kwargs())
         if not await self.login(session=session):
             _LOGGER.warning("Preview session login failed — Stufe-2 poll falls back to the main session")
-            await session.close()
+            session.detach()
             return None
         self._preview_session = session
         return session
@@ -3213,17 +3213,23 @@ class ComexioAPI:
             return []
         return payload.get("data", [])
 
-    async def close(self) -> None:
-        """Close the main session and the dedicated preview session, if one was ever opened.
+    def close(self) -> None:
+        """Detach the main session and the dedicated preview session, if one was ever opened.
 
         The main session is created during config entry setup, so async_create_clientsession
         already registers it for auto-cleanup on entry unload/HA shutdown. The preview session
         (see ensure_preview_session) is created lazily at runtime, outside that setup context,
-        so it only gets HA's homeassistant_stop cleanup — not entry-unload cleanup. Closing both
-        explicitly here (already called from async_unload_entry and the setup-failure path)
+        so it only gets HA's homeassistant_stop cleanup — not entry-unload cleanup. Detaching
+        both explicitly here (already called from async_unload_entry and the setup-failure path)
         avoids leaking the preview session's connection across integration reloads.
+
+        Uses detach() rather than close(): HA replaces close() on its own sessions with a
+        warn-only stub (warn_use), so await session.close() never released anything — it only
+        logged the "closes the Home Assistant aiohttp session" deprecation. detach() is what
+        HA's own cleanup does and actually unlinks the session from the pooled, hass-scoped
+        connector (keyed by verify_ssl/family/ssl_cipher) shared with every other session.
         """
-        await self.session.close()
+        self.session.detach()
         if self._preview_session is not None:
-            await self._preview_session.close()
+            self._preview_session.detach()
             self._preview_session = None

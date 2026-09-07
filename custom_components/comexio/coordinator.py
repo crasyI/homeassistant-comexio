@@ -924,7 +924,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     name=f"comexio_{self.server_id}_function_plan_backup",
                 )
             else:
-                _LOGGER.warning("[%s] Function Plan backup cycle: NOT spawned — lock already held", self.server_id)
+                _LOGGER.debug("[%s] Function Plan backup cycle: NOT spawned — lock already held", self.server_id)
 
             return final_data
 

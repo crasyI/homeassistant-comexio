@@ -61,6 +61,7 @@ from .const import (
     MarkerKind,
     webio_class_label,
     webio_class_name,
+    webio_range_check_entity_id,
 )
 from .coordinator import ComexioCoordinator
 from .entity import ComexioMarkerEntity
@@ -1904,7 +1905,7 @@ class ComexioWebioRangeCheckButton(CoordinatorEntity, ButtonEntity):
         # that derivation only runs once, at first registration, so a translation file
         # that's momentarily out of sync with the code (deploy-order race) would freeze
         # a bad entity_id into the registry permanently.
-        self.entity_id = f"button.comexio_{server_id}_webio_range_check"
+        self.entity_id = webio_range_check_entity_id(server_id)
 
     @property
     def device_info(self) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig, SelectSelectorMode
+from homeassistant.util import slugify
 import voluptuous as vol
 
 from .api import ComexioAPI
@@ -95,12 +96,20 @@ class ComexioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             default_host = user_input.get(CONF_HOST, DEFAULT_HOST)
             _LOGGER.debug("Processing user input for Comexio setup: %s", default_host)
             try:
-                # 1. Validation: Check if the chosen Server ID is already taken
+                # 1. Validation: Check if the chosen Server ID is already taken — compared both
+                # verbatim and slugified, since entity_ids are built from slugify(server_id)
+                # (see webio_range_check_entity_id()) and two distinct raw IDs (e.g. "my-server"
+                # vs. "my_server") would otherwise collide there despite passing this check.
                 chosen_id = user_input[CONF_SERVER_ID].strip().lower()
+                chosen_slug = slugify(chosen_id)
                 for entry in current_entries:
                     existing_id = str(entry.data.get(CONF_SERVER_ID, "")).strip().lower()
-                    if existing_id == chosen_id:
-                        _LOGGER.warning("Setup failed: Server ID '%s' already exists", chosen_id)
+                    if existing_id == chosen_id or slugify(existing_id) == chosen_slug:
+                        _LOGGER.warning(
+                            "Setup failed: Server ID '%s' collides with existing entry '%s'",
+                            chosen_id,
+                            existing_id,
+                        )
                         errors[CONF_SERVER_ID] = "server_id_exists"
                         raise ServerIdExists
 
@@ -234,4 +243,4 @@ class ComexioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             raise
         finally:
             if api is not None:
-                await api.close()
+                api.close()
