@@ -262,7 +262,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 - Enforced Unix (LF) line endings for native Linux/HA compatibility.
 - Added bilingual README (English & German) with step-by-step installation guide.
 
-[Unreleased]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.3...HEAD
+[Unreleased]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.4...HEAD
+[0.9.4]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.3...0.9.4
 [0.9.3]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.2...0.9.3
 [0.9.2]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.1...0.9.2
 [0.9.1]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.0...0.9.1
