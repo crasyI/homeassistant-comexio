@@ -67,7 +67,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await coordinator.async_config_entry_first_refresh()
     except Exception:
         # Close the session on any setup failure to prevent leaks on retry (ConfigEntryNotReady)
-        await api.close()
+        api.close()
         raise
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -459,7 +459,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     if unload_ok:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id)
         if coordinator and hasattr(coordinator, "api"):
-            await coordinator.api.close()
+            coordinator.api.close()
         hass.data[DOMAIN].pop(f"{entry.entry_id}_webhook", None)
 
         # Remove global services when the last entry is unloaded

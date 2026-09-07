@@ -3213,7 +3213,7 @@ class ComexioAPI:
             return []
         return payload.get("data", [])
 
-    async def close(self) -> None:
+    def close(self) -> None:
         """Detach the main session and the dedicated preview session, if one was ever opened.
 
         The main session is created during config entry setup, so async_create_clientsession
