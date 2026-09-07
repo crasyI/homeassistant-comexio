@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 
 ---
 
+## [0.9.4] — 2026-09-07
+
+### 🐛 Bug Fixes & Refactoring
+- **`server_id` slugified consistently everywhere it feeds an `entity_id`/`statistic_id`:** Home Assistant auto-generates entity/statistic IDs via `slugify()`, which normalizes hyphens (and other non-`[a-z0-9_]` characters) to underscores — but several internal lookups still built their comparison prefix with a plain `.lower()`, which leaves hyphens untouched. Any `server_id` containing a hyphen therefore silently failed to match the real HA-generated IDs in the entity-ID-mismatch audit, orphaned-statistics detection, the statistics-unit fix, and the repair flow's sync-button fallback lookup (#71).
+- **Web-IO Range Check button `entity_id` slugified:** The same hyphen issue produced an invalid `entity_id` for the diagnostic Web-IO Range Check button, both on initial creation and in the one-time migration that repoints pre-existing registrations; the formula is now centralized in `const.webio_range_check_entity_id()` so both call sites can't drift apart. The config-flow Server-ID-uniqueness check now also compares slugified forms, since two distinct raw IDs (e.g. `my-server` / `my_server`) would otherwise collide undetected on this shared entity_id (#70, reported in #68).
+- **Session cleanup no longer a silent no-op:** `ComexioAPI.close()` and the preview-session login-failure cleanup called `session.close()`, which Home Assistant replaces on its own sessions with a warn-only stub that only logs a deprecation notice and never actually releases anything. Switched to `session.detach()` — what HA's own cleanup does — to actually unlink the session from the shared, hass-scoped connector pool (#70).
+- **Backup-lock startup log downgraded:** The "Function Plan backup cycle: NOT spawned — lock already held" message fired on nearly every HA start, since the lock is briefly held during normal coordinator startup timing, not just when genuinely stuck. Downgraded from WARNING to DEBUG; an actually-stuck lock still surfaces its own WARNING via the existing timeout in the locked backup-cycle body (#70).
+
+---
+
 ## [0.9.3] — 2026-09-05
 
 ### 🛠️ Core & Stability Improvements
@@ -252,7 +262,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 - Enforced Unix (LF) line endings for native Linux/HA compatibility.
 - Added bilingual README (English & German) with step-by-step installation guide.
 
-[Unreleased]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.3...HEAD
+[Unreleased]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.4...HEAD
+[0.9.4]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.3...0.9.4
 [0.9.3]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.2...0.9.3
 [0.9.2]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.1...0.9.2
 [0.9.1]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.0...0.9.1
