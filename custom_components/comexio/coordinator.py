@@ -1608,10 +1608,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return
         try:
             preview_session = await self.api.ensure_preview_session()
-            self._connection_values = await self.api.get_function_plan_connection_values(
+            connection_values = await self.api.get_function_plan_connection_values(
                 cache["fub_id"], session=preview_session
             )
         except Exception:
+            if self._preview_plan_cache is not cache:
+                # The preview was stopped/replaced (stop_preview() or a new plan armed)
+                # while this request was in flight — its failure no longer belongs to the
+                # now-current preview's failure streak (#75).
+                return
             self._connection_poll_fail_count += 1
             if self._connection_poll_fail_count >= _CONNECTION_POLL_MAX_FAILURES:
                 _LOGGER.exception(
@@ -1635,6 +1640,12 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     _CONNECTION_POLL_MAX_FAILURES,
                 )
             return
+        if self._preview_plan_cache is not cache:
+            # Stale response for a preview that's no longer armed (stopped/replaced while
+            # this request was in flight, #75) — discard it instead of overwriting the
+            # currently armed preview's fresh connection values with old data.
+            return
+        self._connection_values = connection_values
         self._connection_poll_fail_count = 0
         _LOGGER.debug(
             "[%s] Connection-value poll fub=%s plan=%s -> %s",
