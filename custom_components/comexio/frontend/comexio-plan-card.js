@@ -36,6 +36,11 @@ console.info("comexio-plan-card v0.9.31 (Restore-as-Copy + Flussdiagramm-Merge) 
 // without ever having to know the backup manager's internal storage format itself.
 const _BACKUP_LABEL_RE = /^(\w+)\[(\d+)\]/;
 
+// Grace period before disconnectedCallback actually stops the live preview poll — bridges
+// Lovelace's detach+reattach on a view switch/edit-mode toggle without freezing a preview
+// that's still genuinely being watched (#75).
+const _PREVIEW_STOP_GRACE_MS = 2000;
+
 // Must match LIVE_BACKUP_OPTION in select.py — the backup selector's "show the live plan,
 // not a stored snapshot" option, which is the only state where Restore has nothing to do.
 const LIVE_BACKUP_OPTION = "Live";
@@ -323,6 +328,7 @@ class ComexioPlanCard extends HTMLElement {
     this._filterPatterns = []; // debug-log exclude patterns (comma-separated user input)
     this._logPaused = false; // pause button: drop incoming events (deliberately NOT persisted)
     this._analysisHighlightIds = new Set(); // element ids highlighted from a clicked finding
+    this._stopPreviewTimer = null; // pending function_plan_preview_stop grace timer (#75)
   }
 
   setConfig(config) {
@@ -1348,11 +1354,46 @@ class ComexioPlanCard extends HTMLElement {
     }
   }
 
+  connectedCallback() {
+    // Lovelace detaches+reattaches cards on every view switch and edit-mode toggle — not just on
+    // real removal. Cancel a pending stop from disconnectedCallback's grace window so a reattach
+    // within that window doesn't need a fresh "Generate Preview" click to resume live values (#75).
+    if (this._stopPreviewTimer) {
+      clearTimeout(this._stopPreviewTimer);
+      this._stopPreviewTimer = null;
+    }
+    // Mirror disconnectedCallback's _setDebugSession(false): without this, the backend stays on
+    // the slow 2s cadence after any detach/reattach cycle instead of resuming the 0.5s debug
+    // cadence, until the user manually retoggles the debug button (#75).
+    if (this._debugOn) {
+      this._setDebugSession(true);
+    }
+  }
+
   disconnectedCallback() {
-    this._dropDebugSubscription(); // re-armed via `set hass` when the card reattaches
+    if (this._minimal) {
+      return; // trigger-only card never armed a plan/debug/preview session to begin with
+    }
+    this._dropDebugSubscription(); // event subscription; re-armed via `set hass` on reattach
     if (this._debugOn) {
       this._setDebugSession(false); // don't leave the backend stuck in the fast cadence
     }
+    // Stop the Stufe-2 live-value poll after a short grace period instead of instantly, so a
+    // Lovelace DOM move (view switch, edit-mode toggle) — which detaches and immediately
+    // reattaches the card — doesn't freeze the live preview until the user re-triggers
+    // "Generate Preview" by hand. connectedCallback cancels this if we reattach in time (#75).
+    const hass = this._hass;
+    // Multiple Comexio config entries make config_entry required by the service — resolve it the
+    // same way the backup-restore call does, so a routine detach doesn't hit the ambiguous-instance
+    // path and post a spurious "ERROR" notification on every ordinary view switch (#75).
+    const configEntryId = hass?.entities?.[this._config.entity]?.config_entry_id;
+    const data = configEntryId ? { config_entry: configEntryId } : {};
+    this._stopPreviewTimer = setTimeout(() => {
+      this._stopPreviewTimer = null;
+      hass?.callService("comexio", "function_plan_preview_stop", data).catch((err) => {
+        console.warn("comexio-plan-card: function_plan_preview_stop failed", err);
+      });
+    }, _PREVIEW_STOP_GRACE_MS);
   }
 
   // Exclude filter: comma-separated patterns in COMMAND notation (M107, BASE#UL1 — same

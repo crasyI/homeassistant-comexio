@@ -1527,6 +1527,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
             self._preview_auto_stop_cancel()
             self._preview_auto_stop_cancel = None
         self._connection_values = {}
+        # stop_preview() now runs this on every routine view switch (#75), not just rare
+        # true removals — reset here so a transient failure streak doesn't carry into the
+        # next arm and trip the breaker after fewer than _CONNECTION_POLL_MAX_FAILURES.
+        self._connection_poll_fail_count = 0
 
     def _restart_preview_auto_stop(self) -> None:
         """(Re)arm the auto-stop timer at the currently requested duration.
@@ -1567,6 +1571,20 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return False
         self._preview_auto_stop_minutes = minutes
         self._restart_preview_auto_stop()
+        return True
+
+    def stop_preview(self) -> bool:
+        """Disarm the currently armed preview immediately (function_plan_preview_stop service).
+
+        Called by the plan card's disconnectedCallback when it leaves the DOM (page
+        navigation/close), so the Stufe-2 poll stops right away instead of continuing until
+        _PREVIEW_AUTO_STOP_DEFAULT_MINUTES elapses (#75). No-op (returns False) while nothing
+        is armed, same convention as set_preview_auto_stop_extension.
+        """
+        if self._preview_plan_cache is None:
+            return False
+        self._preview_plan_cache = None
+        self._stop_connection_poll()
         return True
 
     def set_debug_session_active(self, active: bool) -> None:

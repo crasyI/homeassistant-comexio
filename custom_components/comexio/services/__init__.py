@@ -14,8 +14,8 @@ multi-purpose") into thematic submodules:
 - `backup`    — function_plan_restore / function_plan_delete_backups /
   function_plan_purge_orphaned_backups / function_plan_list_backups handlers.
 - `misc`      — generate_web_io, set_value, function_plan_debug_session,
-  function_plan_preview_extend, function_plan_search — handlers that don't share enough
-  with the above groups.
+  function_plan_preview_extend, function_plan_preview_stop, function_plan_search — handlers
+  that don't share enough with the above groups.
 
 This module is imported as `from .services import ...` from outside the package (e.g.
 `__init__.py`, `button.py`, `select.py`) exactly as it was when services.py was a single
@@ -55,6 +55,7 @@ from .flow_diagram import _handle_function_plan_flow_diagram
 from .misc import (
     _handle_function_plan_debug_session,
     _handle_function_plan_preview_extend,
+    _handle_function_plan_preview_stop,
     _handle_function_plan_search,
     _handle_set_value,
     handle_generate_web_io,
@@ -96,6 +97,7 @@ _SIMPLE_SERVICES: tuple[tuple[str, Any, SupportsResponse | None], ...] = (
     ("function_plan_list_backups", _handle_function_plan_list_backups, SupportsResponse.ONLY),
     ("function_plan_debug_session", _handle_function_plan_debug_session, None),
     ("function_plan_preview_extend", _handle_function_plan_preview_extend, SupportsResponse.OPTIONAL),
+    ("function_plan_preview_stop", _handle_function_plan_preview_stop, SupportsResponse.OPTIONAL),
     ("function_plan_search", _handle_function_plan_search, SupportsResponse.OPTIONAL),
 )
 

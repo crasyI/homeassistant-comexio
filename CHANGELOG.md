@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 
 ## [Unreleased]
 
+### 🐛 Bug Fixes & Refactoring
+- **Function Plan Preview: silent connection failures no longer bypass the circuit breaker:** `get_function_plan_connection_values` swallowed network/HTTP errors instead of letting them propagate, so a genuinely broken connection to Comexio never tripped the coordinator's 5-failure circuit breaker — the live preview just silently stopped updating instead of disarming with a clear system event (#75).
+- **Function Plan Preview: live poll no longer freezes on an ordinary Lovelace view switch:** The plan card's `disconnectedCallback()` now waits a short grace period before calling the new `function_plan_preview_stop` service, and a new `connectedCallback()` cancels that pending stop if the card reattaches within the window — Lovelace detaches and immediately reattaches cards on every view switch and edit-mode toggle, which previously froze the live preview until "Generate Preview" was clicked again (#75).
+
 ---
 
 ## [0.9.4] — 2026-09-07

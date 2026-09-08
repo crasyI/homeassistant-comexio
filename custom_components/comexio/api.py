@@ -567,44 +567,55 @@ class ComexioAPI:
         }
 
         _LOGGER.debug("Connection values request: POST %s payload=%s", url, payload)
-        try:
-            async with sess.post(url, data=form_data, headers=headers) as resp:
-                if resp.status != 200:
-                    _LOGGER.error("Connection values fetch failed (fub=%s, HTTP %s)", fub_id, resp.status)
-                    return {}
-                try:
-                    data = await resp.json(content_type=None)
-                    raw = (data.get("result") or {}).get("connection")
-                    _LOGGER.debug("Connection values raw response (fub=%s): %s", fub_id, raw)
-                    # Comexio returns the plain-text sentinel "0:not_found" (not JSON) instead
-                    # of a value dict when the plan isn't currently running — confirmed live
-                    # 2026-08-22: an active plan (fub=1) returns a real JSON dict every poll,
-                    # an inactive one (freshly restored/stopped plans included) always returns
-                    # this sentinel. Expected/frequent, not a parse failure — the old code
-                    # logged a full ERROR-level exception for it on every 2s poll tick.
-                    if isinstance(raw, str) and raw and not raw.lstrip().startswith(("{", "[")):
-                        _LOGGER.debug("Connection values: no live data for fub=%s (plan not active: %s)", fub_id, raw)
-                        return {}
-                    parsed = json.loads(raw) if raw else {}
-                    # Same PHP array/object ambiguity as function_plan_load_elements: an
-                    # associative array is serialized as a JSON list whenever its keys are
-                    # exactly 0..N-1 in order — meaning the list position IS the real source
-                    # FubElementId, not a guess (a small/quiet plan's element ids can easily
-                    # land on that sequential shape, e.g. fub=19 with 0 connections -> "[]").
-                    if isinstance(parsed, list):
-                        parsed = {str(i): vals for i, vals in enumerate(parsed)}
-                    result = {elem_id: vals if isinstance(vals, list) else [vals] for elem_id, vals in parsed.items()}
-                    _LOGGER.debug("Connection values parsed (fub=%s): %s", fub_id, result)
-                    return result
-                except Exception:
-                    _LOGGER.exception("Failed to parse connection values response (fub=%s)", fub_id)
-                    return {}
-        except aiohttp.ClientError:
-            _LOGGER.exception("HTTP request error fetching connection values (fub=%s)", fub_id)
-            return {}
-        except Exception:
-            _LOGGER.exception("Unexpected error fetching connection values (fub=%s)", fub_id)
-            return {}
+        # No try/except around the request itself: a transient network failure (e.g.
+        # ServerDisconnectedError) must propagate to the caller's own exception handler —
+        # _async_poll_connection_values counts consecutive failures and disarms the preview
+        # after _CONNECTION_POLL_MAX_FAILURES. Swallowing it here as a plain {} return made it
+        # indistinguishable from the legitimate "plan not running" sentinel below, silently
+        # bypassing that circuit breaker (#75).
+        async with sess.post(url, data=form_data, headers=headers) as resp:
+            # An HTTP error status is as much a poll failure as a network exception — e.g. a
+            # 502 from a server that's mid-reconnect — and must propagate the same way instead
+            # of returning the "plan not running" sentinel shape (#75).
+            resp.raise_for_status()
+            # resp.json() still performs the response body read — a connection drop mid-stream
+            # (ClientPayloadError/ServerDisconnectedError/TimeoutError) must keep propagating to
+            # the caller's circuit breaker, same reasoning as the removed outer try/except above.
+            # json.JSONDecodeError is a genuine parse failure; AttributeError/TypeError cover a
+            # response that parses fine but isn't the expected dict shape (e.g. top-level `null`
+            # or a list) — a body-shape surprise, not a connection failure, so it must not
+            # propagate to the circuit breaker either (#75).
+            try:
+                data = await resp.json(content_type=None)
+                raw = (data.get("result") or {}).get("connection")
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                _LOGGER.exception("Failed to parse connection values response (fub=%s)", fub_id)
+                return {}
+            _LOGGER.debug("Connection values raw response (fub=%s): %s", fub_id, raw)
+            # Comexio returns the plain-text sentinel "0:not_found" (not JSON) instead
+            # of a value dict when the plan isn't currently running — confirmed live
+            # 2026-08-22: an active plan (fub=1) returns a real JSON dict every poll,
+            # an inactive one (freshly restored/stopped plans included) always returns
+            # this sentinel. Expected/frequent, not a parse failure — the old code
+            # logged a full ERROR-level exception for it on every 2s poll tick.
+            if isinstance(raw, str) and raw and not raw.lstrip().startswith(("{", "[")):
+                _LOGGER.debug("Connection values: no live data for fub=%s (plan not active: %s)", fub_id, raw)
+                return {}
+            try:
+                parsed = json.loads(raw) if raw else {}
+                # Same PHP array/object ambiguity as function_plan_load_elements: an
+                # associative array is serialized as a JSON list whenever its keys are
+                # exactly 0..N-1 in order — meaning the list position IS the real source
+                # FubElementId, not a guess (a small/quiet plan's element ids can easily
+                # land on that sequential shape, e.g. fub=19 with 0 connections -> "[]").
+                if isinstance(parsed, list):
+                    parsed = {str(i): vals for i, vals in enumerate(parsed)}
+                result = {elem_id: vals if isinstance(vals, list) else [vals] for elem_id, vals in parsed.items()}
+                _LOGGER.debug("Connection values parsed (fub=%s): %s", fub_id, result)
+                return result
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                _LOGGER.exception("Failed to parse connection values response (fub=%s): %r", fub_id, raw)
+                return {}
 
     def parse_config(
         self,

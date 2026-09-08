@@ -38,6 +38,14 @@ The feature is made up of three integration entities (select, button, image) plu
 optional custom dashboard card (`comexio-plan-card`) that turns the plain image into an
 interactive diagram with search, hover, and a debug console.
 
+> **Known limitation:** the live Stufe-2 poll is scoped per config entry, not per
+> viewer/browser tab. If two dashboards (or two browser tabs) have the plan card open at
+> once, closing one of them stops the live poll for both — the other tab's preview just
+> stops updating until "Generate Preview" is clicked again there. Not an issue for a
+> single-viewer setup. The same "Generate Preview" click is also needed if you switch away
+> from the card's dashboard view for more than a couple of seconds and back — the card only
+> bridges a near-instant Lovelace view switch, not a longer absence.
+
 ---
 
 ## 2. Installing the Dashboard Card
@@ -173,6 +181,7 @@ Available under **Developer Tools → Actions**:
 | `comexio.set_value` | Writes a raw value to a marker or IO — the backend of the debug box's input field. |
 | `comexio.function_plan_debug_session` | Internal — called automatically by the card when its debug box opens or closes. Not meant for manual use. |
 | `comexio.function_plan_preview_extend` | Internal — called automatically by the debug box's `/extend <minutes>` command. Not meant for manual use. |
+| `comexio.function_plan_preview_stop` | Internal — called automatically by the plan card when it leaves the dashboard (after a short grace period, to survive an ordinary view switch). Not meant for manual use. |
 
 ---
 
@@ -753,6 +762,22 @@ function_plan_preview_extend:
           max: 1440
           mode: box
 
+function_plan_preview_stop:
+  name: Function Plan Preview Stop
+  description: >
+    Internal — called by the plan card when it leaves the page (navigation/close).
+    Immediately stops the currently displayed live plan preview's wire-value poll
+    instead of waiting for the auto-stop window to elapse. No effect without a live
+    preview on display.
+  fields:
+    config_entry:
+      name: Comexio instance
+      description: Select the Comexio instance (optional with a single instance).
+      required: false
+      selector:
+        config_entry:
+          integration: comexio
+
 function_plan_search:
   name: Function Plan Search
   description: >
@@ -829,6 +854,15 @@ werden (keine Live-Verbindung zu Comexio nötig) — praktisch, um vor einem
 Das Feature besteht aus drei Integrations-Entitäten (Auswahl, Taster, Bild) sowie einer
 optionalen Custom-Dashboard-Karte (`comexio-plan-card`), die aus dem reinen Bild ein
 interaktives Diagramm mit Suche, Hover und Debug-Konsole macht.
+
+> **Bekannte Einschränkung:** Der Live-Stufe-2-Poll ist pro Config-Entry verdrahtet, nicht
+> pro Betrachter/Browser-Tab. Sind zwei Dashboards (oder zwei Browser-Tabs) gleichzeitig mit
+> geöffneter Plan-Karte aktiv, stoppt das Schließen eines davon den Live-Poll für beide — die
+> andere Vorschau aktualisiert sich dann erst wieder nach erneutem Klick auf
+> „Generate Preview“. Bei nur einem Betrachter kein Thema. Derselbe „Generate Preview“-Klick
+> ist auch nötig, wenn man länger als ein paar Sekunden zu einer anderen Dashboard-Ansicht
+> wechselt und zurück — die Karte überbrückt nur einen nahezu sofortigen Lovelace-Ansichtswechsel,
+> keine längere Abwesenheit.
 
 ---
 
@@ -979,6 +1013,7 @@ Verfügbar unter **Entwicklerwerkzeuge → Aktionen**:
 | `comexio.set_value` | Schreibt einen Rohwert auf einen Merker oder eine IO — das Backend des Eingabefelds der Debug-Box. |
 | `comexio.function_plan_debug_session` | Intern — wird automatisch von der Karte aufgerufen, wenn deren Debug-Box geöffnet oder geschlossen wird. Nicht für manuelle Nutzung gedacht. |
 | `comexio.function_plan_preview_extend` | Intern — wird automatisch vom Debug-Box-Befehl `/extend <Minuten>` aufgerufen. Nicht für manuelle Nutzung gedacht. |
+| `comexio.function_plan_preview_stop` | Intern — wird automatisch von der Plan-Karte aufgerufen, sobald sie das Dashboard verlässt (nach einer kurzen Karenzzeit, damit ein gewöhnlicher Ansichtswechsel sie übersteht). Nicht für manuelle Nutzung gedacht. |
 
 ---
 
