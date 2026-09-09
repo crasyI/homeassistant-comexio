@@ -316,6 +316,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # cached so webhook pushes can re-render it with fresh values without re-fetching
         # the plan from Comexio; a shown snapshot clears the cache (it must not be
         # overwritten by live refreshes). Structural plan edits need a new button press.
+        # INVARIANT: only ever reassigned wholesale (to a fresh dict literal or None), never
+        # mutated in place. _async_poll_connection_values' stale-request guard compares object
+        # identity (self._preview_plan_cache is not cache) to notice a mid-await arm/disarm/
+        # switch; an in-place self._preview_plan_cache[...] = ... would keep the identity and
+        # silently defeat that guard. Re-arming the same plan still allocates a new dict.
         self._preview_plan_cache: dict[str, Any] | None = None
         # Bumped every time the cache above is cleared (explicit stop, auto-stop, poll-failure
         # disarm, or coordinator shutdown) OR re-armed for a different render
@@ -1668,7 +1673,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
             if self._preview_plan_cache is not cache:
                 # The preview was stopped/replaced (stop_preview() or a new plan armed)
                 # while this request was in flight — its failure no longer belongs to the
-                # now-current preview's failure streak (#75).
+                # now-current preview's failure streak (#75). The identity compare is reliable
+                # only because the cache is always reassigned wholesale, never mutated in
+                # place (see _preview_plan_cache's definition).
                 return
             self._connection_poll_fail_count += 1
             if self._connection_poll_fail_count >= _CONNECTION_POLL_MAX_FAILURES:
@@ -1696,7 +1703,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
         if self._preview_plan_cache is not cache:
             # Stale response for a preview that's no longer armed (stopped/replaced while
             # this request was in flight, #75) — discard it instead of overwriting the
-            # currently armed preview's fresh connection values with old data.
+            # currently armed preview's fresh connection values with old data. Relies on the
+            # cache being reassigned wholesale on every (re-)arm, never mutated in place
+            # (see _preview_plan_cache's definition).
             return
         self._connection_values = connection_values
         self._connection_poll_fail_count = 0
