@@ -1390,7 +1390,10 @@ class ComexioPlanCard extends HTMLElement {
     const data = configEntryId ? { config_entry: configEntryId } : {};
     this._stopPreviewTimer = setTimeout(() => {
       this._stopPreviewTimer = null;
-      hass?.callService("comexio", "function_plan_preview_stop", data).catch((err) => {
+      if (!hass) {
+        return;
+      }
+      hass.callService("comexio", "function_plan_preview_stop", data).catch((err) => {
         console.warn("comexio-plan-card: function_plan_preview_stop failed", err);
       });
     }, _PREVIEW_STOP_GRACE_MS);

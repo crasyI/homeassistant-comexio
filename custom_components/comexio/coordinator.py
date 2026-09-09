@@ -311,6 +311,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # the plan from Comexio; a shown snapshot clears the cache (it must not be
         # overwritten by live refreshes). Structural plan edits need a new button press.
         self._preview_plan_cache: dict[str, Any] | None = None
+        # Bumped every time the cache above is cleared (explicit stop, auto-stop, poll-failure
+        # disarm, or coordinator shutdown) OR re-armed for a different render
+        # (_update_live_preview_cache / _update_snapshot_preview_cache). async_generate_plan_preview
+        # captures this at entry and skips its cache-committing tail if it changed while the render
+        # was awaiting I/O — otherwise a stale render finishing after stop_preview() would resurrect
+        # a preview that was already told to stop, or a slow render could clobber a newer,
+        # concurrently-armed one for a different plan (#77).
+        self._preview_cache_generation: int = 0
         self._preview_refresh_cancel: Any = None
         # Stufe 2: last fetched {connection_id: value} for the armed live plan (see
         # _async_poll_connection_values) and the timer driving that poll. Cleared/stopped
@@ -1286,6 +1294,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         label maps so a historical snapshot shows the names it had at capture time rather
         than today's (possibly since-renamed) live names. None for a live render.
         """
+        cache_generation_before = self._preview_cache_generation
         markers_by_id, webio_by_id, ios_by_id = self._resolve_preview_label_maps(label_metadata)
         catalog = await self.function_plan_catalog.async_get_catalog()
         title_suffix, canvas = self._build_preview_title_and_canvas(fub_id)
@@ -1325,12 +1334,24 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "source": source,
             "generated_at": dt_util.utcnow().isoformat(),
         }
-        if source == "live":
-            self._update_live_preview_cache(fub_id, plan_name, elements, connections, plan_switched)
+        # The preview may have been stopped (or auto-stopped, disarmed after repeated poll
+        # failures, shut down, or re-armed by a concurrent render for a different plan) while
+        # the awaits above were in flight — committing the cache now would resurrect a preview
+        # that was explicitly told to stop, or clobber a newer render with a stale one (#77).
+        # The already-written SVG/last_plan_preview above stay as the last rendered frame
+        # either way; only the re-arming is skipped.
+        if cache_generation_before == self._preview_cache_generation:
+            if source == "live":
+                self._update_live_preview_cache(fub_id, plan_name, elements, connections, plan_switched)
+            else:
+                kind, slot = _parse_snapshot_source(source)
+                self._update_snapshot_preview_cache(
+                    fub_id, plan_name, elements, connections, kind, slot, label_metadata, live_id_map
+                )
         else:
-            kind, slot = _parse_snapshot_source(source)
-            self._update_snapshot_preview_cache(
-                fub_id, plan_name, elements, connections, kind, slot, label_metadata, live_id_map
+            _LOGGER.debug(
+                "[%s] Plan preview cache commit skipped: cache generation changed while rendering",
+                self.server_id,
             )
         self.async_set_updated_data(self.data)
         return f"/local/{filename}"
@@ -1418,6 +1439,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "label_metadata": None,
             "live_id_map": None,
         }
+        self._preview_cache_generation += 1
         if plan_switched:
             self._restart_connection_poll(fast=self._connection_poll_fast_requested)
             self._preview_auto_stop_minutes = _PREVIEW_AUTO_STOP_DEFAULT_MINUTES
@@ -1455,6 +1477,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "label_metadata": label_metadata,
             "live_id_map": live_id_map,
         }
+        self._preview_cache_generation += 1
         if not already_armed:
             self._restart_connection_poll(fast=self._connection_poll_fast_requested)
             self._preview_auto_stop_minutes = _PREVIEW_AUTO_STOP_DEFAULT_MINUTES
@@ -1503,7 +1526,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             await self._render_armed_preview()
         except Exception:
             # Disable further refreshes; the next preview button press re-arms.
-            self._preview_plan_cache = None
+            self._disarm_preview_cache()
             _LOGGER.exception("[%s] Plan preview refresh failed", self.server_id)
 
     def _restart_connection_poll(self, fast: bool) -> None:
@@ -1558,7 +1581,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             f"Live-Poll nach {self._preview_auto_stop_minutes} Minuten automatisch gestoppt — "
             "Plan erneut öffnen, um ihn fortzusetzen"
         )
-        self._preview_plan_cache = None
+        self._disarm_preview_cache()
         self._stop_connection_poll()
 
     def set_preview_auto_stop_extension(self, minutes: int) -> bool:
@@ -1573,6 +1596,16 @@ class ComexioCoordinator(DataUpdateCoordinator):
         self._restart_preview_auto_stop()
         return True
 
+    def _disarm_preview_cache(self) -> None:
+        """Clear the armed-preview cache and bump _preview_cache_generation (see its docstring).
+
+        Shared by every disarm path (explicit stop, auto-stop, refresh/poll failure, coordinator
+        shutdown) so none of them can forget the generation bump and reintroduce the
+        stale-render race (#77).
+        """
+        self._preview_plan_cache = None
+        self._preview_cache_generation += 1
+
     def stop_preview(self) -> bool:
         """Disarm the currently armed preview immediately (function_plan_preview_stop service).
 
@@ -1583,7 +1616,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         """
         if self._preview_plan_cache is None:
             return False
-        self._preview_plan_cache = None
+        self._disarm_preview_cache()
         self._stop_connection_poll()
         return True
 
@@ -1625,7 +1658,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     self.server_id,
                     self._connection_poll_fail_count,
                 )
-                self._preview_plan_cache = None
+                self._disarm_preview_cache()
                 self._stop_connection_poll()
                 self._connection_poll_fail_count = 0
                 self._fire_plan_system_event(
@@ -1665,6 +1698,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
         if self._preview_refresh_cancel is not None:
             self._preview_refresh_cancel()
             self._preview_refresh_cancel = None
+        # Disarm the preview cache too — otherwise a render still in flight at shutdown time
+        # (e.g. an in-progress async_generate_plan_preview) could commit its cache after
+        # HA has already moved on, one of the disarm paths missed by the original fix (#77).
+        self._disarm_preview_cache()
         await super().async_shutdown()
 
     def _fire_plan_system_event(self, message: str) -> None:
