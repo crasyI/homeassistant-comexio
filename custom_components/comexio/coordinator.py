@@ -87,6 +87,8 @@ from .const import (
     SYNC_DURATION_FUNCTION_PLAN_ELEMENT,
     SYNC_DURATION_FUNCTION_PLAN_FINALIZE,
     WATCHDOG_HISTORY_MAX_ENTRIES,
+    WEBHOOK_UNKNOWN_IO_LOG_MSG,
+    WEBHOOK_VALUE_LOG_MSG,
     WEBIO_CLASS_IO,
     WEBIO_CLASS_MARKER,
     WEBIO_CLASSES,
@@ -1766,6 +1768,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
     def update_marker(self, marker_id: str | int, value: float | int | str) -> None:
         marker_id_str = str(marker_id)
+        previous = self.marker_states.get(marker_id_str)
         self.marker_states[marker_id_str] = value
         self._webhook_updated_markers.add(marker_id_str)  # R1: mark as received during possible fetch
         label = f"M{marker_id_str}"
@@ -1775,6 +1778,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     m["value"] = value
                     label = m.get("name") or label
                     break
+        _LOGGER.debug(WEBHOOK_VALUE_LOG_MSG, "marker", label, value, previous)
         self.async_set_updated_data(self.data)
         self._fire_plan_event("marker", marker_id_str, label, value)
         self.schedule_plan_preview_refresh()
@@ -1782,10 +1786,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
     def update_io_by_name(self, ext_name: str, identifier: str, value: float | int | str) -> None:
         key = (ext_name.lower(), identifier.lower())
         if io := self._io_index.get(key):
+            previous = self.io_states.get(io["id"])
             self.io_states[io["id"]] = value
             io["value"] = value
             self._webhook_updated_io_ids.add(io["id"])  # R1: mark as received during possible fetch
-            self._fire_plan_event("io", str(io["id"]), io.get("name") or f"{ext_name} {identifier}", value)
+            label = io.get("name") or f"{ext_name} {identifier}"
+            _LOGGER.debug(WEBHOOK_VALUE_LOG_MSG, "io", label, value, previous)
+            self._fire_plan_event("io", str(io["id"]), label, value)
+        else:
+            _LOGGER.warning(WEBHOOK_UNKNOWN_IO_LOG_MSG, ext_name, identifier, value)
         self.async_set_updated_data(self.data)
         self.schedule_plan_preview_refresh()
 
