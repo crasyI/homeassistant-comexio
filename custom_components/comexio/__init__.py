@@ -460,7 +460,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     if unload_ok:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id)
         if coordinator and hasattr(coordinator, "api"):
-            coordinator.api.close()
+            # Stop the connection-value poll timer (and any pending preview refresh) before
+            # closing the sessions it polls through — otherwise the timer keeps firing on
+            # this now-unloaded entry, each tick racing close() for the preview session.
+            # finally: a raise out of async_shutdown() must not skip the session cleanup below.
+            try:
+                await coordinator.async_shutdown()
+            finally:
+                coordinator.api.close()
         hass.data[DOMAIN].pop(f"{entry.entry_id}_webhook", None)
 
         # Remove global services when the last entry is unloaded

@@ -217,6 +217,15 @@ class ComexioAPI:
         # [[project-logikplan-preview]] on why a stuck live-poll starved the whole coordinator.
         # Created lazily on first use, not here — most setups never open the preview.
         self._preview_session: aiohttp.ClientSession | None = None
+        # Guards ensure_preview_session()'s check-then-act window: HA's interval scheduler
+        # fires poll ticks without awaiting the previous one, so at the 0.5s fast-poll
+        # cadence (debug box active) multiple ticks can see _preview_session is None before
+        # the first login() completes — each would otherwise start its own redundant login.
+        self._preview_session_lock = asyncio.Lock()
+        # Set by close(); lets a login() already in flight inside the lock above notice
+        # the instance was torn down while it was waiting and give up instead of leaking
+        # a freshly-authenticated session past unload (see close() for the full race).
+        self._closed: bool = False
 
         # Comexio's own firmware/frontend version (e.g. "11.0.2"), from static asset paths
         self.comexio_version: str | None = None
@@ -250,13 +259,29 @@ class ComexioAPI:
         """
         if self._preview_session is not None:
             return self._preview_session
-        session = async_create_clientsession(self.hass, **self._build_session_kwargs())
-        if not await self.login(session=session):
-            _LOGGER.warning("Preview session login failed — Stufe-2 poll falls back to the main session")
-            session.detach()
-            return None
-        self._preview_session = session
-        return session
+        async with self._preview_session_lock:
+            # Re-check: another tick may have finished creating the session while this
+            # one was waiting for the lock.
+            if self._preview_session is not None:
+                return self._preview_session
+            if self._closed:
+                return None
+            session = async_create_clientsession(self.hass, **self._build_session_kwargs())
+            login_ok = False
+            try:
+                login_ok = await self.login(session=session)
+            finally:
+                # Any non-success path (failed login, close() during the await above, or
+                # login() raising) must not leave an authenticated session orphaned.
+                if not login_ok or self._closed:
+                    session.detach()
+            if not login_ok:
+                _LOGGER.warning("Preview session login failed — Stufe-2 poll falls back to the main session")
+                return None
+            if self._closed:
+                return None
+            self._preview_session = session
+            return session
 
     @property
     def _base_url(self) -> str:
@@ -3239,7 +3264,13 @@ class ComexioAPI:
         logged the "closes the Home Assistant aiohttp session" deprecation. detach() is what
         HA's own cleanup does and actually unlinks the session from the pooled, hass-scoped
         connector (keyed by verify_ssl/family/ssl_cipher) shared with every other session.
+
+        Also flags the instance as closed so a login() already in flight inside
+        ensure_preview_session()'s lock detaches its freshly-authenticated session instead of
+        assigning it to self._preview_session after this point — that session would otherwise
+        never be detached (it was never visible here to begin with).
         """
+        self._closed = True
         self.session.detach()
         if self._preview_session is not None:
             self._preview_session.detach()
