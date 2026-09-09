@@ -1525,9 +1525,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
         try:
             await self._render_armed_preview()
         except Exception:
-            # Disable further refreshes; the next preview button press re-arms.
-            self._disarm_preview_cache()
+            # Log before cleanup: a failure inside _disarm_preview_cache()/_stop_connection_poll()
+            # (both synchronous, no I/O, but not provably infallible) must never mask the actual
+            # render failure's traceback.
             _LOGGER.exception("[%s] Plan preview refresh failed", self.server_id)
+            # Disable further refreshes; the next preview button press re-arms. Also stop the
+            # Stufe-2 connection-value poll — otherwise its timer keeps firing indefinitely as a
+            # no-op against an already-cleared cache (#77).
+            self._disarm_preview_cache()
+            self._stop_connection_poll()
 
     def _restart_connection_poll(self, fast: bool) -> None:
         """(Re)start the Stufe-2 connection-value poll at the given cadence.
