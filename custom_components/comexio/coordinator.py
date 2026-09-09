@@ -257,6 +257,12 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # wasn't loaded yet — re-run once the backup cycle has loaded it (see _audit_wired_pairs
         # / _async_function_plan_backup_cycle).
         self._lp_missing_recheck_pending: bool = False
+        # fub_ids present in function_plan_plans as of the last backup cycle — lets the cycle
+        # tell "a relevant plan just landed" apart from "nothing changed, but a plan the bulk
+        # endpoint never delivers is still missing" (e.g. a persistently malformed entry skipped
+        # by function_plan_load_all_plans). Without this, a recheck that can never succeed would
+        # retrigger async_request_refresh() on every single backup cycle forever.
+        self._last_bulk_snapshot_fub_ids: frozenset[int] = frozenset()
         # Marker IDs (type-2 element ref_ids) referenced in a plan as of the last parse_config
         # call — an unnamed marker still needs a real entity/value if it's wired somewhere (see
         # api._process_markers). Tracked here so a change triggers an immediate extra refresh
@@ -747,9 +753,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # marker's own Web-IO wiring is audited exactly like any other marker (missing_items
             # etc.); this only checks the separate Marker+Flanke self-reset construct.
             trigger_marker_ids = [int(m["id"]) for m in final_data["markers"] if m.get("kind") == MarkerKind.TRIGGER]
-            function_plan_trigger_missing_ids, function_plan_trigger_orphan_ids = self._audit_trigger_pairs(
-                trigger_marker_ids
-            )
+            trigger_audit_result = self._audit_trigger_pairs(trigger_marker_ids)
+            if trigger_audit_result is None:
+                self._lp_missing_recheck_pending = True
+                trigger_audit_result = ([], [])
+            function_plan_trigger_missing_ids, function_plan_trigger_orphan_ids = trigger_audit_result
             for mid in function_plan_trigger_missing_ids:
                 mismatches.add(f"function_plan_trigger_missing_M{mid}")
             for mid in function_plan_trigger_orphan_ids:
@@ -982,9 +990,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # keeping the comparison anchored to what entities were actually built from.
             new_referenced_markers = self._referenced_marker_ids() or set()
             markers_changed = new_referenced_markers != self._last_referenced_marker_ids
-            if self._lp_missing_recheck_pending or markers_changed:
-                # The audit skipped the function_plan_missing check because the snapshot was
-                # not loaded yet — re-run it now that wiring data is available.
+            snapshot_fub_ids = frozenset(plans.keys())
+            snapshot_changed = snapshot_fub_ids != self._last_bulk_snapshot_fub_ids
+            self._last_bulk_snapshot_fub_ids = snapshot_fub_ids
+            if (self._lp_missing_recheck_pending and snapshot_changed) or markers_changed:
+                # The audit skipped the function_plan_missing check because a relevant plan
+                # wasn't loaded yet — re-run it now that the snapshot actually changed. Gating
+                # on snapshot_changed (not just the pending flag) keeps a relevant plan that the
+                # bulk endpoint can never deliver (e.g. a persistently malformed entry) from
+                # retriggering this refresh every single cycle forever.
                 self._lp_missing_recheck_pending = False
                 await self.async_request_refresh()
             fub_data = self.api.fub_data
@@ -3319,15 +3333,41 @@ class ComexioCoordinator(DataUpdateCoordinator):
             connected.update(ref_by_elem_id[eid] for eid in endpoint_ids if eid in ref_by_elem_id)
         return connected
 
+    def _relevant_plans_loaded(self, relevant_fub_ids: set[int]) -> bool:
+        """Whether every fub_id relevant to the wiring audit is already in the bulk snapshot.
+
+        Checking only "is the snapshot non-empty" is not enough: right after startup/reload
+        the backup cycle fills function_plan_plans incrementally, so a snapshot can already
+        hold some plans while a relevant one (e.g. the marker cluster plan containing a
+        marker's real Web-IO pair) has not landed yet. Treating that partial state as "ready"
+        makes _wired_source_webio_pairs/_connected_source_ids scan only the fub_ids that
+        happen to be loaded and silently miss the rest, which _function_plan_gap_item then
+        misreports as a genuinely missing wire.
+
+        relevant_fub_ids is narrowed to still-existing plans first: a fub_id can outlive its
+        plan in CONF_FUNCTION_PLAN_PLAN_MAP (deleted/renamed directly in Comexio — the same
+        stale-entry case _stale_plan_map_entries cleans up, but only on the sync-button path,
+        never here). An unnarrowed check would wait forever for a fub_id that function_plan_
+        load_all_plans() — itself filtered against fub_data — can never deliver, permanently
+        returning False and, via _lp_missing_recheck_pending, retriggering a refresh every
+        backup cycle without end. The empty-snapshot guard stays explicit so the original
+        startup race (no plans loaded yet at all) is still caught even when relevant_fub_ids
+        itself is empty (legacy CONF_FUNCTION_PLAN_FUB_ID == "auto").
+        """
+        if not self.function_plan_plans:
+            return False
+        existing_fub_ids = {int(fub_id) for fub_id in self.api.fub_data}
+        return (relevant_fub_ids & existing_fub_ids) <= self.function_plan_plans.keys()
+
     def _connected_source_ids(self, source_type: str) -> set[str] | None:
         """ref_ids of `source_type` elements with ANY connection at all, across every plan
         relevant to the wiring audit — see _plan_connected_source_ids. Mirrors
         _wired_source_webio_pairs' scoping (same relevant_fub_ids, same None-while-not-loaded
         contract) since both feed the same audit cycle.
         """
-        if not self.function_plan_plans:
-            return None
         relevant_fub_ids = self._function_plan_check_fub_ids()
+        if not self._relevant_plans_loaded(relevant_fub_ids):
+            return None
         connected: set[str] = set()
         for fub_id, plan_data in self.function_plan_plans.items():
             if fub_id in relevant_fub_ids:
@@ -3338,8 +3378,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
         """Return (ref_id, webIoId) pairs of source elements (marker "2" / IO "1") directly
         wired to a WebIO element in a managed plan.
 
-        Built from the bulk snapshot of the backup cycle; returns None while that snapshot is
-        not loaded yet. A pair only counts as wired when the source element and the WebIO
+        Built from the bulk snapshot of the backup cycle; returns None while any plan relevant
+        to the audit (see _function_plan_check_fub_ids) is not loaded into that snapshot yet,
+        including a partially-populated snapshot missing just one of them. A pair only counts
+        as wired when the source element and the WebIO
         (type-10) element are endpoints of the SAME connection — merely having the WebIO
         ref_id appear in some unrelated connection is not enough. ref_ids are device-local and
         the server assigns them globally increasing only "in practice", so a stray element of
@@ -3353,9 +3395,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
         plan is, and scanning it too would mask a real gap in the managed plan as "wired
         elsewhere".
         """
-        if not self.function_plan_plans:
-            return None
         relevant_fub_ids = self._function_plan_check_fub_ids()
+        if not self._relevant_plans_loaded(relevant_fub_ids):
+            return None
         pairs: set[tuple[str, str]] = set()
         for fub_id, plan_data in self.function_plan_plans.items():
             if fub_id in relevant_fub_ids:
@@ -3535,7 +3577,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "ios_by_ext": {ext: [gaps_by_ext[ext], totals_by_ext[ext]] for ext in sorted(gaps_by_ext)},
         }
 
-    def _audit_trigger_pairs(self, trigger_marker_ids: list[int]) -> tuple[list[int], list[int]]:
+    def _audit_trigger_pairs(self, trigger_marker_ids: list[int]) -> tuple[list[int], list[int]] | None:
         """Compare trigger markers ([TRIG]/[TP]) against the dedicated trigger plan's wiring.
 
         Returns (missing_ids, orphan_ids): missing = trigger marker without a *complete*
@@ -3553,14 +3595,22 @@ class ComexioCoordinator(DataUpdateCoordinator):
         "no trigger plan yet" instead of being audited as if it still were the trigger plan —
         otherwise a coincidentally-complete pair in that unrelated plan would make a trigger
         marker look wired when resolve_trigger_plan() would actually create a fresh plan.
+
+        Returns None instead while the trigger plan's fub_id is a confirmed existing plan
+        that simply has not landed in the bulk snapshot yet (same partial-snapshot startup/
+        reload window _relevant_plans_loaded guards against for the generic Web-IO wiring
+        check) — otherwise an unloaded-but-real plan would read as "zero wired pairs" and
+        misreport every trigger marker as missing until the next poll.
         """
         raw_map = self.config_entry.options.get(CONF_FUNCTION_PLAN_PLAN_MAP, {})
         plan_map = {k: int(v) for k, v in raw_map.items()} if isinstance(raw_map, dict) else {}
         fub_id = plan_map.get(FUNCTION_PLAN_TRIGGER_PLAN_NAME)
         if fub_id is None or self.api.fub_data.get(str(fub_id), {}).get("Name") != FUNCTION_PLAN_TRIGGER_PLAN_NAME:
             return list(trigger_marker_ids), []
+        if fub_id not in self.function_plan_plans:
+            return None
 
-        plan_data = self.function_plan_plans.get(fub_id)
+        plan_data = self.function_plan_plans[fub_id]
         existing_by_ref, _ = self.api._function_plan_existing_refs(plan_data)
         all_marker_ids = {ref_id for ref_type, ref_id in existing_by_ref if ref_type == 2}
         wired_marker_ids = self.api._function_plan_trigger_wired_marker_ids(plan_data)
@@ -3588,6 +3638,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
         element in the trigger plan as orphaned, deleting valid self-reset pairs over what was
         really just a transient fetch failure. So an empty result skips the audit entirely
         (missing=[], orphan=[] — a safe no-op); the next successful poll or sync retries it.
+
+        _audit_trigger_pairs() can itself return None (trigger plan exists but its data hasn't
+        landed in the bulk snapshot yet) — treated the same safe-no-op way here, since this
+        caller (button.py, mid-sync) has no non-blocking way to force that snapshot to refresh
+        and must not misread "not loaded yet" as "plan is empty, everything's orphaned."
         """
         raw_config = await self.api.get_raw_config()
         if not raw_config:
@@ -3599,7 +3654,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return [], []
         parsed = self.api.parse_config(raw_config)
         trigger_marker_ids = [int(m["id"]) for m in parsed["markers"] if m.get("kind") == MarkerKind.TRIGGER]
-        return self._audit_trigger_pairs(trigger_marker_ids)
+        trigger_audit_result = self._audit_trigger_pairs(trigger_marker_ids)
+        if trigger_audit_result is None:
+            _LOGGER.warning(
+                "[%s] Trigger re-audit: trigger plan not yet in the bulk snapshot — skipping "
+                "this sync's trigger-pair check, will retry on the next poll",
+                self.server_id,
+            )
+            return [], []
+        return trigger_audit_result
 
     def _function_plan_missing_eta_sec(self, missing_items: list[dict]) -> int:
         """Estimate the duration of the add-pairs repair action in seconds.
