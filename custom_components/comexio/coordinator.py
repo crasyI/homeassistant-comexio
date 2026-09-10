@@ -3905,6 +3905,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         needs something to be suffixed to), so it's never affected by the referenced-marker
         cold-start fallback that only concerns unnamed markers.
 
+        get_raw_config() returns {} on an HTTP failure rather than raising — indistinguishable
         from a genuinely empty config by shape alone. Proceeding anyway would derive empty
         trigger id lists and make _audit_trigger_pairs() read every existing source element
         in the trigger plan as orphaned, deleting valid self-reset pairs over what was really
