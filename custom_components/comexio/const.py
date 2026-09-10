@@ -1,10 +1,13 @@
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+import logging
 import re
 from typing import Any
 
 from homeassistant.util import slugify
+
+_LOGGER = logging.getLogger(__name__)
 
 # Version: 0.8.1
 DOMAIN = "comexio"
@@ -214,11 +217,20 @@ def active_webio_classes(conf: Mapping[str, Any]) -> tuple[WebioClass, ...]:
 
 
 def classify_audit_key(key: str) -> WebioClass:
-    """Map an internal audit-map key back to its Web-IO class by longest-matching prefix."""
-    best, best_len = WebioClass.MARKER, -1
+    """Map an internal audit-map key back to its Web-IO class by longest-matching prefix.
+
+    Every audit key built via io_audit_key()/source_audit_key() carries a registered
+    prefix, so the loop below always finds a match in practice; the MARKER fallback only
+    guards against a malformed/unexpected key reaching this function and is logged rather
+    than applied silently, so such a case doesn't masquerade as a genuine Marker key.
+    """
+    best, best_len = None, -1
     for cat in SOURCE_CATEGORIES.values():
         if key.startswith(cat.audit_key_prefix) and len(cat.audit_key_prefix) > best_len:
             best, best_len = cat.key, len(cat.audit_key_prefix)
+    if best is None:
+        _LOGGER.warning("classify_audit_key: no category matches key %r, defaulting to MARKER", key)
+        return WebioClass.MARKER
     return best
 
 

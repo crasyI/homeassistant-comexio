@@ -322,6 +322,13 @@ class ComexioCoordinator(DataUpdateCoordinator):
         self.offline_entity_statistic_ids: set[str] = set()
         self.offline_extensions: set[str] | None = None
         self._extension_offline_issue_active: bool = False
+        # Per-category item counts from the last successful poll, unfiltered by import_*
+        # opt-in (unlike final_data) but still subject to parse_config()'s own filtering
+        # (e.g. unnamed markers, offline IOs) — {} before the first poll. Lets options_flow
+        # show/hide an opt-in toggle (e.g. import_knx) based on whether the Comexio server
+        # currently has that category's objects at all, without options_flow itself needing
+        # to know about parse_config().
+        self.available_source_counts: dict[WebioClass, int] = {}
         self.cover_keywords: list[str] = []
         # R4: Lock to prevent concurrent sync runs
         self._sync_lock: asyncio.Lock = asyncio.Lock()
@@ -447,6 +454,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 referenced_markers = await self.function_plan_backup.async_referenced_marker_ids()
             self._last_referenced_marker_ids = referenced_markers
             parsed_data = self.api.parse_config(raw_config, live_states, referenced_markers)
+            # Unfiltered per-category counts — parsed_data carries every category regardless of
+            # import_* opt-in, unlike final_data below. See available_source_counts docstring.
+            # Held locally and only published to self.available_source_counts right before the
+            # final `return final_data` below — this dict is built early in the poll, well
+            # before the rest of this method (audits, IP checks, Function Plan sync) has had a
+            # chance to fail, and the attribute's contract is "last *successful* poll". Writing
+            # it here directly would leak counts from a poll that ends up raising further down.
+            source_counts = {cat.key: len(parsed_data.get(cat.data_key, [])) for cat in SOURCE_CATEGORIES.values()}
 
             # async_update_from_raw_config never raises (own contract, enforced internally) —
             # no local guard needed here.
@@ -596,11 +611,18 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 if key == full_name:
                     parts = full_name.split(" ")
                     if len(parts) >= 3:
-                        if parts[1].startswith("K"):
-                            # KNX object identification via "HA K<ID> <Name>"
-                            key = parts[1]
-                        elif parts[1].startswith("M"):
-                            # Marker identification via "HA M<ID> <Name>"
+                        # Registry-driven: any range_clustered category ("HA <prefix><ID> <Name>",
+                        # e.g. Marker/KNX) is identified by its audit_key_prefix, so a further
+                        # range_clustered category needs no new branch here.
+                        range_clustered_cat = next(
+                            (
+                                cat
+                                for cat in SOURCE_CATEGORIES.values()
+                                if cat.range_clustered and parts[1].startswith(cat.audit_key_prefix)
+                            ),
+                            None,
+                        )
+                        if range_clustered_cat is not None:
                             key = parts[1]
                         elif parts[1] == "IO" and len(parts) >= 4:
                             # IO identification via "HA IO <Ext> <Ident>" (best-effort only —
@@ -1045,6 +1067,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
             else:
                 _LOGGER.debug("[%s] Function Plan backup cycle: NOT spawned — lock already held", self.server_id)
 
+            # Publish only now that the whole poll succeeded — see source_counts comment above.
+            self.available_source_counts = source_counts
             return final_data
 
         except Exception as e:
@@ -2884,12 +2908,12 @@ class ComexioCoordinator(DataUpdateCoordinator):
         )
 
     @staticmethod
-    def _cluster_plan_name(source_id: int, prefix: str, cluster_size: int, category_label: str = "Marker") -> str:
+    def _cluster_plan_name(source_id: int, prefix: str, cluster_size: int, category_label: str) -> str:
         """Name of the managed cluster plan a marker/KNX object belongs to (deterministic bucket math)."""
         start = ((source_id - 1) // cluster_size) * cluster_size + 1
         return f"{prefix} - {category_label} [{start}-{start + cluster_size - 1}]"
 
-    def expected_source_cluster_name(self, source_id: int, category_label: str = "Marker") -> str:
+    def expected_source_cluster_name(self, source_id: int, category_label: str) -> str:
         """Deterministic cluster-plan name a marker/KNX ID currently maps to (config-aware)."""
         return self._cluster_plan_name(
             source_id, self._function_plan_prefix(), self._function_plan_cluster_size(), category_label
@@ -2897,11 +2921,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
     def expected_marker_cluster_name(self, marker_id: int) -> str:
         """Deterministic cluster-plan name a marker ID currently maps to (config-aware)."""
-        return self.expected_source_cluster_name(marker_id, "Marker")
+        return self.expected_source_cluster_name(marker_id, SOURCE_CATEGORIES[WebioClass.MARKER].label)
 
     def expected_knx_cluster_name(self, knx_id: int) -> str:
         """Deterministic cluster-plan name a KNX object ID currently maps to (config-aware)."""
-        return self.expected_source_cluster_name(knx_id, "KNX")
+        return self.expected_source_cluster_name(knx_id, SOURCE_CATEGORIES[WebioClass.KNX].label)
 
     def io_cluster_plan_contains(self, live_plan_name: str, ext_name: str) -> bool:
         """True if a live plan name still parses as a managed IO cluster plan naming ext_name.
@@ -2915,7 +2939,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         return members is not None and ext_name in members
 
     async def resolve_marker_clusters(
-        self, marker_ids: list[int], category_label: str = "Marker"
+        self, marker_ids: list[int], category_label: str
     ) -> tuple[dict[int, list[int]], set[int]]:
         """Group marker/KNX IDs by cluster plan and resolve/create each plan.
 
@@ -2957,7 +2981,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
     async def resolve_knx_clusters(self, knx_ids: list[int]) -> tuple[dict[int, list[int]], set[int]]:
         """Group KNX object IDs by cluster plan and resolve/create each plan (KNX counterpart of
         resolve_marker_clusters — same bucket math, plans named "HA - KNX [x-y]")."""
-        return await self.resolve_marker_clusters(knx_ids, category_label="KNX")
+        return await self.resolve_marker_clusters(knx_ids, category_label=SOURCE_CATEGORIES[WebioClass.KNX].label)
 
     async def resolve_trigger_plan(self) -> tuple[int | None, bool]:
         """Find or create the single dedicated "HA - TRIGGER" plan. Returns (fub_id, freshly_created)."""
@@ -3886,9 +3910,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 orphan_by_ref[ref_type] = orphan_ids
         return missing_by_ref, orphan_by_ref
 
-    def _audit_trigger_pairs(
-        self, trigger_marker_ids: list[int], ref_type: int = 2
-    ) -> tuple[list[int], list[int]] | None:
+    def _audit_trigger_pairs(self, trigger_marker_ids: list[int], ref_type: int) -> tuple[list[int], list[int]] | None:
         """Compare trigger sources ([TRIG]/[TP]) of one category (ref_type) against the
         dedicated trigger plan's wiring.
 
@@ -4009,12 +4031,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
         new_pairs_per_plan: dict[str, int] = {}
         for item in missing_items:
-            if "marker_id" in item:
-                plan_name = self._cluster_plan_name(item["marker_id"], prefix, cluster_size)
-            elif "knx_id" in item:
-                plan_name = self._cluster_plan_name(item["knx_id"], prefix, cluster_size, "KNX")
-            else:
-                plan_name = self._io_cluster_plan_name_for_ext(item["ext_name"], prefix)
+            # Reuses the same registry-driven lookup as _function_plan_missing_detail
+            # instead of a parallel "marker_id"/"knx_id" in item chain.
+            plan_name = self._range_cluster_plan_name_for_item(
+                item, prefix, cluster_size
+            ) or self._io_cluster_plan_name_for_ext(item["ext_name"], prefix)
             new_pairs_per_plan[plan_name] = new_pairs_per_plan.get(plan_name, 0) + 1
 
         total = 0.0

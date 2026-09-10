@@ -1689,7 +1689,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         )
 
     def _check_plan_rename_mismatch(
-        self, fub_id: int, cluster_ids: list[int], plan_name: str, category_label: str = "Marker"
+        self, fub_id: int, cluster_ids: list[int], plan_name: str, category_label: str
     ) -> tuple[str, list[int], list[str]] | None:
         """Aborted-result tuple if the plan was renamed/repurposed since resolve_marker_clusters() ran."""
         expected_name = self.coordinator.expected_source_cluster_name(cluster_ids[0], category_label)

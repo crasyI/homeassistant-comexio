@@ -27,6 +27,8 @@ from .const import (
     DOMAIN,
     SCAN_INTERVAL_DEFAULT,
     SCAN_INTERVAL_OPTIONS,
+    SourceCategory,
+    WebioClass,
     ignore_list_categories,
     parse_ignored_marker_tokens,
 )
@@ -91,16 +93,32 @@ class ComexioOptionsFlow(config_entries.OptionsFlow):
         """Manage the options."""
         conf = {**self._config_entry.data, **self._config_entry.options}
         errors: dict[str, str] = {}
+        source_cats = ignore_list_categories()
+
+        # {} before the coordinator's first successful poll — never hide a category in that
+        # case, only once real counts are known. See coordinator.available_source_counts
+        # docstring. A category stays visible once opted in even at count 0, so a user who
+        # opted in before the server had objects (or during a transient scrape gap) can still
+        # find the toggle to turn it back off — mirrors the ext_names multi-select pattern
+        # below (keep already-saved selections choosable even once no longer "current").
+        coordinator = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
+        available_counts = getattr(coordinator, "available_source_counts", None) or {}
+        hidden_cats = {
+            cat.key
+            for cat in source_cats
+            if available_counts
+            and not available_counts.get(cat.key)
+            and not conf.get(cat.import_conf_key, cat.import_default)
+        }
 
         if user_input is not None:
-            self._normalize_user_input(user_input, conf, errors)
+            self._normalize_user_input(user_input, conf, errors, hidden_cats)
             if not errors:
                 return self._create_options_entry(user_input)
 
         # Extension names for the IO cluster multi-select: live coordinator data first,
         # excluding offline extensions (no hardware present — wiring them is pointless),
         # but keeping already-saved selections choosable so they can be deselected.
-        coordinator = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
         coordinator_data = getattr(coordinator, "data", None) or {}
         ext_names = sorted({io["ext_name"] for io in coordinator_data.get("io", []) if not io.get("offline")})
         ext_names.extend(ext for ext in conf.get(CONF_FUNCTION_PLAN_IO_EXTENSIONS, []) if ext not in ext_names)
@@ -108,14 +126,19 @@ class ComexioOptionsFlow(config_entries.OptionsFlow):
         # Marker + KNX share the same schema/import/ignored-ids field shape (registry-driven
         # via ignore_list_categories — the source categories that support an ignore-list);
         # IO keeps its own fields since its unique_id/no-ignore-list shape differs.
-        source_cats = ignore_list_categories()
         schema_dict: dict = {}
         for cat in source_cats:
+            # Same visibility as the opt-in toggle below — a naming-schema field for a category
+            # the user can't even opt into would be a dead field.
+            if cat.key in hidden_cats:
+                continue
             schema_dict[
                 vol.Optional(cat.schema_conf_key, default=conf.get(cat.schema_conf_key, cat.schema_default))
             ] = str
         schema_dict[vol.Optional(CONF_SCHEMA_IO, default=conf.get(CONF_SCHEMA_IO, DEFAULT_SCHEMA_IO))] = str
         for cat in source_cats:
+            if cat.key in hidden_cats:
+                continue
             schema_dict[
                 vol.Required(cat.import_conf_key, default=conf.get(cat.import_conf_key, cat.import_default))
             ] = bool
@@ -161,6 +184,10 @@ class ComexioOptionsFlow(config_entries.OptionsFlow):
             vol.Optional(CONF_COVER_KEYWORDS, default=conf.get(CONF_COVER_KEYWORDS, DEFAULT_COVER_KEYWORDS))
         ] = str
         for cat in source_cats:
+            # Same visibility as the opt-in toggle above — an ignore-list for a category the
+            # user can't even opt into would be a dead field.
+            if cat.key in hidden_cats:
+                continue
             schema_dict[vol.Optional(cat.ignored_conf_key, default=conf.get(cat.ignored_conf_key, ""))] = str
         schema_dict[
             vol.Optional(
@@ -211,16 +238,26 @@ class ComexioOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema_dict), errors=errors)
 
     @staticmethod
-    def _normalize_user_input(user_input: dict, conf: dict, errors: dict) -> None:
+    def _restore_missing_ignored_fields(
+        user_input: dict, conf: dict, source_cats: list[SourceCategory], hidden_cats: set[WebioClass]
+    ) -> None:
+        """Preserve the old ignored_conf_key value for any category voluptuous sent no change for.
+
+        A hidden category (see async_step_init's docstring) is expectedly absent from
+        user_input — restored quietly. Any other absence is unexpected and logged.
+        """
+        for cat in source_cats:
+            if cat.ignored_conf_key in user_input:
+                continue
+            if cat.key not in hidden_cats:
+                _LOGGER.warning("%s field missing from user_input — restoring from saved options", cat.ignored_conf_key)
+            user_input[cat.ignored_conf_key] = conf.get(cat.ignored_conf_key, "")
+
+    @staticmethod
+    def _normalize_user_input(user_input: dict, conf: dict, errors: dict, hidden_cats: set[WebioClass]) -> None:
         """Validate and normalize user_input in-place; populate errors on failure."""
         source_cats = ignore_list_categories()
-
-        # If a field is missing from user_input, voluptuous didn't receive changes for it —
-        # preserve the old value (registry-driven: Marker + KNX ignore-list fields).
-        for cat in source_cats:
-            if cat.ignored_conf_key not in user_input:
-                _LOGGER.warning("%s field missing from user_input — restoring from saved options", cat.ignored_conf_key)
-                user_input[cat.ignored_conf_key] = conf.get(cat.ignored_conf_key, "")
+        ComexioOptionsFlow._restore_missing_ignored_fields(user_input, conf, source_cats, hidden_cats)
 
         numeric_option_keys = (
             "scan_interval",
