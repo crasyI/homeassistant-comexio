@@ -456,9 +456,12 @@ class ComexioCoordinator(DataUpdateCoordinator):
             parsed_data = self.api.parse_config(raw_config, live_states, referenced_markers)
             # Unfiltered per-category counts — parsed_data carries every category regardless of
             # import_* opt-in, unlike final_data below. See available_source_counts docstring.
-            self.available_source_counts = {
-                cat.key: len(parsed_data.get(cat.data_key, [])) for cat in SOURCE_CATEGORIES.values()
-            }
+            # Held locally and only published to self.available_source_counts right before the
+            # final `return final_data` below — this dict is built early in the poll, well
+            # before the rest of this method (audits, IP checks, Function Plan sync) has had a
+            # chance to fail, and the attribute's contract is "last *successful* poll". Writing
+            # it here directly would leak counts from a poll that ends up raising further down.
+            source_counts = {cat.key: len(parsed_data.get(cat.data_key, [])) for cat in SOURCE_CATEGORIES.values()}
 
             # async_update_from_raw_config never raises (own contract, enforced internally) —
             # no local guard needed here.
@@ -1064,6 +1067,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
             else:
                 _LOGGER.debug("[%s] Function Plan backup cycle: NOT spawned — lock already held", self.server_id)
 
+            # Publish only now that the whole poll succeeded — see source_counts comment above.
+            self.available_source_counts = source_counts
             return final_data
 
         except Exception as e:
