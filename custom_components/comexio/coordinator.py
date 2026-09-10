@@ -3429,7 +3429,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
         all_matches = [
             elem_id
             for elem_id, elem_data in plan_data.get("elements", {}).items()
-            if (ref := elem_data.get("reference", {})).get("type") == ref_type
+            # reference.type comes back as int or str depending on the response shape — normalize.
+            if str((ref := elem_data.get("reference", {})).get("type")) == str(ref_type)
             and int(ref.get("ref_id", -1)) == marker_id
         ]
         if len(all_matches) > 1:

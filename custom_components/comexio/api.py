@@ -3120,7 +3120,8 @@ class ComexioAPI:
         """Return the plan-local element id of the given source ref (marker=2/KNX=11), or None if not wired."""
         for elem_id, elem_data in elements.items():
             ref = elem_data.get("reference", {})
-            if ref.get("type") == ref_type and int(ref.get("ref_id", -1)) == marker_id:
+            # reference.type comes back as int or str depending on the response shape — normalize.
+            if str(ref.get("type")) == str(ref_type) and int(ref.get("ref_id", -1)) == marker_id:
                 return str(elem_id)
         return None
 
