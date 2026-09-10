@@ -3837,16 +3837,30 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
     def _trigger_ids_by_ref(self, data: dict[str, Any]) -> dict[int, list[int]]:
         """Trigger source ids ([TRIG]/[TP]) grouped by plan-element ref_type, one bucket per
-        trigger-capable source category (marker ref_type=2, KNX ref_type=11 — blind guess).
+        active, trigger-capable source category (marker ref_type=2, KNX ref_type=11 — blind guess).
 
         Marker and KNX ids share one numeric space, so the audit has to run per category
         rather than over a flat merged list — this produces the per-ref_type input for it.
+
+        Deliberately skips a category the user has opted out of (not in active_webio_classes)
+        instead of producing an empty bucket for it: unlike the Web-IO wiring/dangling audit,
+        which reads structure straight from the plan snapshot and stays correct regardless of
+        opt-in, _audit_trigger_pairs' orphan detection depends on this method's *positive*
+        list of still-legitimate trigger sources — every existing plan element not in that
+        list is treated as orphaned and gets deleted by the next full sync. Since data[cat.
+        data_key] is deliberately empty for an opted-out category (see _async_update_data),
+        an unfiltered bucket for it would misread "we didn't look" as "none of these are
+        trigger sources anymore" and delete every real trigger pair the moment the category
+        is toggled off. Skipping the bucket entirely leaves that category's trigger wiring
+        untouched while inactive, consistent with async_check_ignored_sources' same guard.
         """
+        active = self.active_webio_classes
         return {
             int(cat.fub_module_type): [
                 int(item["id"]) for item in data[cat.data_key] if item.get("kind") == MarkerKind.TRIGGER
             ]
             for cat in trigger_pair_categories()
+            if cat.key in active
         }
 
     def _audit_all_trigger_pairs(
@@ -3955,15 +3969,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 self.server_id,
             )
             return {}, {}
+        # parse_config() itself doesn't know about import_* opt-in flags and returns every
+        # category unfiltered — but that's fine here: _trigger_ids_by_ref() now does its own
+        # active_webio_classes gating (an earlier version of this method instead blanked an
+        # opted-out category's list to [] before handing it to _trigger_ids_by_ref, which
+        # backfired — see that method's docstring for why an empty-but-present bucket reads
+        # as "every existing trigger pair just got orphaned" rather than "category inactive,
+        # don't touch its wiring").
         parsed = self.api.parse_config(raw_config)
-        # parse_config() itself doesn't know about import_* opt-in flags — mirror what
-        # _async_update_data does for final_data, or an opted-out category (e.g. KNX) would
-        # get its trigger pairs audited/wired anyway.
-        conf = {**self.config_entry.data, **self.config_entry.options}
-        active = active_webio_classes(conf)
-        for cls, cat in SOURCE_CATEGORIES.items():
-            if cls not in active:
-                parsed[cat.data_key] = []
         trigger_audit_result = self._audit_all_trigger_pairs(self._trigger_ids_by_ref(parsed))
         if trigger_audit_result is None:
             _LOGGER.warning(
