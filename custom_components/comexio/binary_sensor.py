@@ -98,6 +98,14 @@ class ComexioMarkerBinarySensor(ComexioMarkerEntity, BinarySensorEntity):
 class ComexioKnxBinarySensor(ComexioKnxEntity, ComexioMarkerBinarySensor):
     """A read-only ("[RO]") digital Comexio KNX object (blind implementation, see project_knx_objects memory)."""
 
+    @property
+    def is_on(self) -> bool | None:
+        """None until the first webhook. Unlike markers, KNX objects have no authoritative
+        poll path, so a pre-webhook value would be a fabricated 'off' rather than a known state.
+        """
+        val = self._source_value
+        return None if val is None else float(val or 0) >= 1.0
+
 
 class ComexioSdCardSensor(BinarySensorEntity):
     """Whether the Comexio server currently reports an SD card as present.

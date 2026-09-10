@@ -3754,6 +3754,20 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return {"name": ha_name, "ext_name": io_meta["ext_name"], "identifier": io_meta["identifier"]}
         return None
 
+    def _range_cluster_plan_name_for_item(self, item: dict, prefix: str, cluster_size: int) -> str | None:
+        """Cluster-plan name for a missing-wiring item ({marker_id|knx_id: ...}), or None for an IO item."""
+        for cat in (c for c in SOURCE_CATEGORIES.values() if c.range_clustered):
+            if (id_key := f"{cat.key.value}_id") in item:
+                return self._cluster_plan_name(item[id_key], prefix, cluster_size, cat.label)
+        return None
+
+    def _range_cluster_plan_name_for_key(self, key: str, prefix: str, cluster_size: int) -> str | None:
+        """Cluster-plan name for an audit-map key ("M<id>"/"K<id>"), or None for an IO key."""
+        for cat in (c for c in SOURCE_CATEGORIES.values() if c.range_clustered):
+            if key.startswith(cat.audit_key_prefix):
+                return self._cluster_plan_name(int(key[len(cat.audit_key_prefix) :]), prefix, cluster_size, cat.label)
+        return None
+
     def _function_plan_missing_detail(
         self, missing_items: list[dict], ha_map: dict, io_meta_by_key: dict
     ) -> dict[str, Any]:
@@ -3775,22 +3789,13 @@ class ComexioCoordinator(DataUpdateCoordinator):
         )
         gaps_by_plan: dict[str, int] = {}
         for item in missing_items:
-            if "marker_id" in item:
-                plan_name = self._cluster_plan_name(item["marker_id"], prefix, cluster_size)
-                gaps_by_plan[plan_name] = gaps_by_plan.get(plan_name, 0) + 1
-            elif "knx_id" in item:
-                plan_name = self._cluster_plan_name(item["knx_id"], prefix, cluster_size, "KNX")
+            if (plan_name := self._range_cluster_plan_name_for_item(item, prefix, cluster_size)) is not None:
                 gaps_by_plan[plan_name] = gaps_by_plan.get(plan_name, 0) + 1
         totals_by_plan = dict.fromkeys(gaps_by_plan, 0)
         for key in ha_map:
-            if key.startswith("M"):
-                plan_name = self._cluster_plan_name(int(key[1:]), prefix, cluster_size)
-                if plan_name in totals_by_plan:
-                    totals_by_plan[plan_name] += 1
-            elif key.startswith("K"):
-                plan_name = self._cluster_plan_name(int(key[1:]), prefix, cluster_size, "KNX")
-                if plan_name in totals_by_plan:
-                    totals_by_plan[plan_name] += 1
+            plan_name = self._range_cluster_plan_name_for_key(key, prefix, cluster_size)
+            if plan_name in totals_by_plan:
+                totals_by_plan[plan_name] += 1
 
         gaps_by_ext: dict[str, int] = {}
         for item in missing_items:

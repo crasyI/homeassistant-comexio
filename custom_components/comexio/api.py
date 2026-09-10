@@ -962,9 +962,10 @@ class ComexioAPI:
 
         No live_states here on purpose: get_live_states() only ever queries marker values
         ("MarkerName": f"M{i}"), keyed by the same plain numeric id KNX objects use — passing
-        it through would silently hand e.g. KNX object 5 marker 5's live value. KNX objects
-        start at value 0 and pick up their real value from the next webhook push instead
-        (BLIND GUESS: no known bulk live-value endpoint for KNX objects).
+        it through would silently hand e.g. KNX object 5 marker 5's live value. There is no
+        known bulk live-value endpoint for KNX objects (BLIND GUESS), so the real value only
+        arrives via the next webhook push; until then the entities report "unknown" rather
+        than this placeholder 0 (see ComexioKnx* is_on/native_value).
         """
         data["knx"].extend(
             self._process_source_items(

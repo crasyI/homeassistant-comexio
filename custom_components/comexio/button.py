@@ -1374,6 +1374,37 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
 
     # --- MANAGED CLUSTER PLAN WIRING ---
 
+    @staticmethod
+    def _classify_created_names(
+        created_names: list[str],
+        clustered_cats: list[SourceCategory],
+        known_io_names: dict[str, tuple[str, str]],
+    ) -> tuple[dict[WebioClass, list[int]], list[tuple[str, str]]]:
+        """Split freshly-created Web-IO command names into per-category source ids and IO refs."""
+        source_ids_by_cat: dict[WebioClass, list[int]] = {}
+        created_io_refs: list[tuple[str, str]] = []
+        for name in created_names:
+            for cat in clustered_cats:
+                if (sid := _parse_source_id_from_webio_name(name, cat.audit_key_prefix)) is not None:
+                    source_ids_by_cat.setdefault(cat.key, []).append(sid)
+                    break
+            else:
+                if (io_ref := _parse_io_from_webio_name(name, known_io_names)) is not None:
+                    created_io_refs.append(io_ref)
+        return source_ids_by_cat, created_io_refs
+
+    @staticmethod
+    def _merge_gap_source_ids(
+        source_ids_by_cat: dict[WebioClass, list[int]], gap_items: list[dict], gap_keys: dict[str, SourceCategory]
+    ) -> list[dict]:
+        """Fold pre-existing unwired range-clustered gap items into source_ids_by_cat in place;
+        return the leftover IO gap items."""
+        for item in gap_items:
+            for gap_key, cat in gap_keys.items():
+                if gap_key in item:
+                    source_ids_by_cat.setdefault(cat.key, []).append(item[gap_key])
+        return [item for item in gap_items if not any(k in item for k in gap_keys)]
+
     async def _wire_created_pairs(
         self, ctx: _SyncContext, created_names: list[str], gap_items: list[dict]
     ) -> list[str]:
@@ -1402,23 +1433,11 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         # label differ. IO stays a separate branch (per-extension plans, composite key).
         clustered_cats = [cat for cat in SOURCE_CATEGORIES.values() if cat.range_clustered]
         gap_keys = {f"{cat.key.value}_id": cat for cat in clustered_cats}
-        source_ids_by_cat: dict[WebioClass, list[int]] = {}
-        created_io_refs: list[tuple[str, str]] = []
-        for name in created_names:
-            for cat in clustered_cats:
-                if (sid := _parse_source_id_from_webio_name(name, cat.audit_key_prefix)) is not None:
-                    source_ids_by_cat.setdefault(cat.key, []).append(sid)
-                    break
-            else:
-                if (io_ref := _parse_io_from_webio_name(name, known_io_names)) is not None:
-                    created_io_refs.append(io_ref)
+
+        source_ids_by_cat, created_io_refs = self._classify_created_names(created_names, clustered_cats, known_io_names)
 
         if ctx.action in {"full_sync", "function_plan_add_missing"}:
-            for item in gap_items:
-                for gap_key, cat in gap_keys.items():
-                    if gap_key in item:
-                        source_ids_by_cat.setdefault(cat.key, []).append(item[gap_key])
-            gap_io_items = [item for item in gap_items if not any(k in item for k in gap_keys)]
+            gap_io_items = self._merge_gap_source_ids(source_ids_by_cat, gap_items, gap_keys)
         else:
             gap_io_items = []
 

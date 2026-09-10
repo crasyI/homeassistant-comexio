@@ -86,6 +86,14 @@ class ComexioMarkerSwitch(ComexioMarkerEntity, SwitchEntity):
 class ComexioKnxSwitch(ComexioKnxEntity, ComexioMarkerSwitch):
     """A digital Comexio KNX object as a Switch (blind implementation, see project_knx_objects memory)."""
 
+    @property
+    def is_on(self) -> bool | None:
+        """None until the first webhook. Unlike markers, KNX objects have no authoritative
+        poll path, so a pre-webhook value would be a fabricated 'off' rather than a known state.
+        """
+        val = self._source_value
+        return None if val is None else float(val or 0) >= 1.0
+
 
 class ComexioIOSwitch(ComexioIOEntity, SwitchEntity):
     """Representation of a Comexio Digital Output (Relay) as a Switch."""
