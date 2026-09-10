@@ -225,6 +225,15 @@ class ComexioAPI:
         # [[project-logikplan-preview]] on why a stuck live-poll starved the whole coordinator.
         # Created lazily on first use, not here — most setups never open the preview.
         self._preview_session: aiohttp.ClientSession | None = None
+        # Guards ensure_preview_session()'s check-then-act window: HA's interval scheduler
+        # fires poll ticks without awaiting the previous one, so at the 0.5s fast-poll
+        # cadence (debug box active) multiple ticks can see _preview_session is None before
+        # the first login() completes — each would otherwise start its own redundant login.
+        self._preview_session_lock = asyncio.Lock()
+        # Set by close(); lets a login() already in flight inside the lock above notice
+        # the instance was torn down while it was waiting and give up instead of leaking
+        # a freshly-authenticated session past unload (see close() for the full race).
+        self._closed: bool = False
 
         # Comexio's own firmware/frontend version (e.g. "11.0.2"), from static asset paths
         self.comexio_version: str | None = None
@@ -258,13 +267,29 @@ class ComexioAPI:
         """
         if self._preview_session is not None:
             return self._preview_session
-        session = async_create_clientsession(self.hass, **self._build_session_kwargs())
-        if not await self.login(session=session):
-            _LOGGER.warning("Preview session login failed — Stufe-2 poll falls back to the main session")
-            session.detach()
-            return None
-        self._preview_session = session
-        return session
+        async with self._preview_session_lock:
+            # Re-check: another tick may have finished creating the session while this
+            # one was waiting for the lock.
+            if self._preview_session is not None:
+                return self._preview_session
+            if self._closed:
+                return None
+            session = async_create_clientsession(self.hass, **self._build_session_kwargs())
+            login_ok = False
+            try:
+                login_ok = await self.login(session=session)
+            finally:
+                # Any non-success path (failed login, close() during the await above, or
+                # login() raising) must not leave an authenticated session orphaned.
+                if not login_ok or self._closed:
+                    session.detach()
+            if not login_ok:
+                _LOGGER.warning("Preview session login failed — Stufe-2 poll falls back to the main session")
+                return None
+            if self._closed:
+                return None
+            self._preview_session = session
+            return session
 
     @property
     def _base_url(self) -> str:
@@ -575,44 +600,55 @@ class ComexioAPI:
         }
 
         _LOGGER.debug("Connection values request: POST %s payload=%s", url, payload)
-        try:
-            async with sess.post(url, data=form_data, headers=headers) as resp:
-                if resp.status != 200:
-                    _LOGGER.error("Connection values fetch failed (fub=%s, HTTP %s)", fub_id, resp.status)
-                    return {}
-                try:
-                    data = await resp.json(content_type=None)
-                    raw = (data.get("result") or {}).get("connection")
-                    _LOGGER.debug("Connection values raw response (fub=%s): %s", fub_id, raw)
-                    # Comexio returns the plain-text sentinel "0:not_found" (not JSON) instead
-                    # of a value dict when the plan isn't currently running — confirmed live
-                    # 2026-08-22: an active plan (fub=1) returns a real JSON dict every poll,
-                    # an inactive one (freshly restored/stopped plans included) always returns
-                    # this sentinel. Expected/frequent, not a parse failure — the old code
-                    # logged a full ERROR-level exception for it on every 2s poll tick.
-                    if isinstance(raw, str) and raw and not raw.lstrip().startswith(("{", "[")):
-                        _LOGGER.debug("Connection values: no live data for fub=%s (plan not active: %s)", fub_id, raw)
-                        return {}
-                    parsed = json.loads(raw) if raw else {}
-                    # Same PHP array/object ambiguity as function_plan_load_elements: an
-                    # associative array is serialized as a JSON list whenever its keys are
-                    # exactly 0..N-1 in order — meaning the list position IS the real source
-                    # FubElementId, not a guess (a small/quiet plan's element ids can easily
-                    # land on that sequential shape, e.g. fub=19 with 0 connections -> "[]").
-                    if isinstance(parsed, list):
-                        parsed = {str(i): vals for i, vals in enumerate(parsed)}
-                    result = {elem_id: vals if isinstance(vals, list) else [vals] for elem_id, vals in parsed.items()}
-                    _LOGGER.debug("Connection values parsed (fub=%s): %s", fub_id, result)
-                    return result
-                except Exception:
-                    _LOGGER.exception("Failed to parse connection values response (fub=%s)", fub_id)
-                    return {}
-        except aiohttp.ClientError:
-            _LOGGER.exception("HTTP request error fetching connection values (fub=%s)", fub_id)
-            return {}
-        except Exception:
-            _LOGGER.exception("Unexpected error fetching connection values (fub=%s)", fub_id)
-            return {}
+        # No try/except around the request itself: a transient network failure (e.g.
+        # ServerDisconnectedError) must propagate to the caller's own exception handler —
+        # _async_poll_connection_values counts consecutive failures and disarms the preview
+        # after _CONNECTION_POLL_MAX_FAILURES. Swallowing it here as a plain {} return made it
+        # indistinguishable from the legitimate "plan not running" sentinel below, silently
+        # bypassing that circuit breaker (#75).
+        async with sess.post(url, data=form_data, headers=headers) as resp:
+            # An HTTP error status is as much a poll failure as a network exception — e.g. a
+            # 502 from a server that's mid-reconnect — and must propagate the same way instead
+            # of returning the "plan not running" sentinel shape (#75).
+            resp.raise_for_status()
+            # resp.json() still performs the response body read — a connection drop mid-stream
+            # (ClientPayloadError/ServerDisconnectedError/TimeoutError) must keep propagating to
+            # the caller's circuit breaker, same reasoning as the removed outer try/except above.
+            # json.JSONDecodeError is a genuine parse failure; AttributeError/TypeError cover a
+            # response that parses fine but isn't the expected dict shape (e.g. top-level `null`
+            # or a list) — a body-shape surprise, not a connection failure, so it must not
+            # propagate to the circuit breaker either (#75).
+            try:
+                data = await resp.json(content_type=None)
+                raw = (data.get("result") or {}).get("connection")
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                _LOGGER.exception("Failed to parse connection values response (fub=%s)", fub_id)
+                return {}
+            _LOGGER.debug("Connection values raw response (fub=%s): %s", fub_id, raw)
+            # Comexio returns the plain-text sentinel "0:not_found" (not JSON) instead
+            # of a value dict when the plan isn't currently running — confirmed live
+            # 2026-08-22: an active plan (fub=1) returns a real JSON dict every poll,
+            # an inactive one (freshly restored/stopped plans included) always returns
+            # this sentinel. Expected/frequent, not a parse failure — the old code
+            # logged a full ERROR-level exception for it on every 2s poll tick.
+            if isinstance(raw, str) and raw and not raw.lstrip().startswith(("{", "[")):
+                _LOGGER.debug("Connection values: no live data for fub=%s (plan not active: %s)", fub_id, raw)
+                return {}
+            try:
+                parsed = json.loads(raw) if raw else {}
+                # Same PHP array/object ambiguity as function_plan_load_elements: an
+                # associative array is serialized as a JSON list whenever its keys are
+                # exactly 0..N-1 in order — meaning the list position IS the real source
+                # FubElementId, not a guess (a small/quiet plan's element ids can easily
+                # land on that sequential shape, e.g. fub=19 with 0 connections -> "[]").
+                if isinstance(parsed, list):
+                    parsed = {str(i): vals for i, vals in enumerate(parsed)}
+                result = {elem_id: vals if isinstance(vals, list) else [vals] for elem_id, vals in parsed.items()}
+                _LOGGER.debug("Connection values parsed (fub=%s): %s", fub_id, result)
+                return result
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                _LOGGER.exception("Failed to parse connection values response (fub=%s): %r", fub_id, raw)
+                return {}
 
     def parse_config(
         self,
@@ -3357,7 +3393,13 @@ class ComexioAPI:
         logged the "closes the Home Assistant aiohttp session" deprecation. detach() is what
         HA's own cleanup does and actually unlinks the session from the pooled, hass-scoped
         connector (keyed by verify_ssl/family/ssl_cipher) shared with every other session.
+
+        Also flags the instance as closed so a login() already in flight inside
+        ensure_preview_session()'s lock detaches its freshly-authenticated session instead of
+        assigning it to self._preview_session after this point — that session would otherwise
+        never be detached (it was never visible here to begin with).
         """
+        self._closed = True
         self.session.detach()
         if self._preview_session is not None:
             self._preview_session.detach()

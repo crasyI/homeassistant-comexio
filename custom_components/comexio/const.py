@@ -512,6 +512,15 @@ FUNCTION_PLAN_SERVICE_NAMES = (
 # live plan preview — consumed by the comexio-plan-card debug box (frontend/).
 EVENT_PLAN_VALUE = "comexio_plan_event"
 
+# DEBUG-log line emitted once per inbound webhook value push (marker or IO). Lets a burst of
+# "Manually updated comexio data" coordinator lines be traced back to the exact marker/IO and
+# value that caused it. Args: kind ("marker"/"io"), resolved label, new value, previous value.
+WEBHOOK_VALUE_LOG_MSG = "Webhook %s push: %s = %r (prev %r)"
+
+# WARNING emitted when a webhook pushes a value for an IO key that is not in the parsed config
+# index — the value cannot be tracked and is dropped. Args: ext name, identifier, new value.
+WEBHOOK_UNKNOWN_IO_LOG_MSG = "Webhook push for unknown IO %s/%s (value %r) — not tracked, dropped"
+
 # Marker for a comment element the restore-as-new path adds to a rebuilt plan, so a user
 # opening it in Comexio Studio immediately understands why it exists and shouldn't hand-edit it.
 FUNCTION_PLAN_MANAGED_PLAN_COMMENT = "! Administrated by HomeAssistant, dont delete or rename !"

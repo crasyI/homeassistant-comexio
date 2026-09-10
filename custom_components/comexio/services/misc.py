@@ -27,6 +27,7 @@ _LOGGER = logging.getLogger(__name__)
 _TITLE_SET_VALUE_ERR = "Set Value — Error"
 _TITLE_DEBUG_SESSION_ERR = "Function Plan Debug Session — Error"
 _TITLE_PREVIEW_EXTEND_ERR = "Function Plan Preview Extend — Error"
+_TITLE_PREVIEW_STOP_ERR = "Function Plan Preview Stop — Error"
 _TITLE_SEARCH_ERR = "Function Plan Search — Error"
 _INSTANCE_NOT_RESOLVED_ERR = "Comexio instance not resolved."
 
@@ -273,6 +274,30 @@ async def _handle_function_plan_preview_extend(hass: HomeAssistant, call: Servic
     if not extended:
         return {"success": False, "error": "No live plan preview is currently armed."}
     return {"success": True, "minutes": minutes}
+
+
+async def _handle_function_plan_preview_stop(hass: HomeAssistant, call: ServiceCall) -> dict:
+    """Immediately disarm the currently armed live plan preview (#75).
+
+    Called by the plan card's disconnectedCallback when it leaves the DOM, so the Stufe-2
+    poll stops right away instead of continuing until the auto-stop window elapses — see
+    coordinator.stop_preview. No fub_id/entity targeting, same single-instance resolution
+    as function_plan_debug_session.
+    """
+    ctx = await _async_get_service_context(hass, call, _TITLE_PREVIEW_STOP_ERR, resolve_plan=False, do_login=False)
+    if ctx is None:
+        return {"success": False, "error": _INSTANCE_NOT_RESOLVED_ERR}
+    coordinator, _api, _fub_id = ctx
+
+    stopped = coordinator.stop_preview()
+    if not stopped:
+        # Expected/frequent: the card's disconnectedCallback grace timer fires after the preview
+        # was already stopped some other way (auto-stop, a second card's disconnect) — not worth
+        # an info-level log line on every such no-op.
+        _LOGGER.debug("Function Plan Preview Stop: no live plan preview is currently armed")
+        return {"success": False, "error": "No live plan preview is currently armed."}
+    _LOGGER.info("Function Plan Preview Stop: stopped live plan preview")
+    return {"success": True}
 
 
 async def _search_plan_labels(

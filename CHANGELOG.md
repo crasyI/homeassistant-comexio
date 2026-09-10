@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 
 ---
 
+## [0.9.5] — 2026-09-09
+
+### 🐛 Bug Fixes & Refactoring
+- **Trigger markers no longer false-flagged as unwired by the audit:** `[TRIG]`/`[TP]` markers were reported as missing their Web-IO pair-partner connection even though it was correctly wired in the Marker Plan. Root cause: the check ran against a bulk function-plan snapshot that can be non-empty overall while the specific plan relevant to that marker (the dedicated trigger plan, or a managed marker-cluster plan) hadn't landed in it yet — a normal race right after startup/reload — and the unloaded plan was misread as "empty" instead of "not ready yet". The check now explicitly defers to the next poll cycle in that case, closing the same partial-snapshot race for the generic Web-IO pair audit as well. Genuine missing Web-IO pairs are still reported — only check timing was fixed, not completeness (#78).
+- **Function Plan Preview: silent connection failures no longer bypass the circuit breaker:** `get_function_plan_connection_values` swallowed network/HTTP errors instead of letting them propagate, so a genuinely broken connection to Comexio never tripped the coordinator's 5-failure circuit breaker — the live preview just silently stopped updating instead of disarming with a clear system event (#75).
+- **Function Plan Preview: live poll no longer freezes on an ordinary Lovelace view switch:** The plan card's `disconnectedCallback()` now waits a short grace period before calling the new `function_plan_preview_stop` service, and a new `connectedCallback()` cancels that pending stop if the card reattaches within the window — Lovelace detaches and immediately reattaches cards on every view switch and edit-mode toggle, which previously froze the live preview until "Generate Preview" was clicked again (#75).
+- **Release notes no longer silently overwritten after publish:** The `releasenotes` CI job ran on every `release: published` event and unconditionally replaced the manually curated release body with a generic commit-list summary, clobbering issue references and contributor credit right after publish. Removed the job and its now-orphaned generator script (#73).
+
+---
+
 ## [0.9.4] — 2026-09-07
 
 ### 🐛 Bug Fixes & Refactoring
@@ -262,7 +272,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 - Enforced Unix (LF) line endings for native Linux/HA compatibility.
 - Added bilingual README (English & German) with step-by-step installation guide.
 
-[Unreleased]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.4...HEAD
+[Unreleased]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.5...HEAD
+[0.9.5]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.4...0.9.5
 [0.9.4]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.3...0.9.4
 [0.9.3]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.2...0.9.3
 [0.9.2]: https://github.com/kayl-codes/homeassistant-comexio/compare/0.9.1...0.9.2

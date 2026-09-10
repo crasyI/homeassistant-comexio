@@ -87,6 +87,8 @@ from .const import (
     SYNC_DURATION_FUNCTION_PLAN_ELEMENT,
     SYNC_DURATION_FUNCTION_PLAN_FINALIZE,
     WATCHDOG_HISTORY_MAX_ENTRIES,
+    WEBHOOK_UNKNOWN_IO_LOG_MSG,
+    WEBHOOK_VALUE_LOG_MSG,
     WEBIO_CLASS_IO,
     WEBIO_CLASS_KNX,
     WEBIO_CLASS_MARKER,
@@ -281,6 +283,12 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # wasn't loaded yet — re-run once the backup cycle has loaded it (see _audit_wired_pairs
         # / _async_function_plan_backup_cycle).
         self._lp_missing_recheck_pending: bool = False
+        # fub_ids present in function_plan_plans as of the last backup cycle — lets the cycle
+        # tell "a relevant plan just landed" apart from "nothing changed, but a plan the bulk
+        # endpoint never delivers is still missing" (e.g. a persistently malformed entry skipped
+        # by function_plan_load_all_plans). Without this, a recheck that can never succeed would
+        # retrigger async_request_refresh() on every single backup cycle forever.
+        self._last_bulk_snapshot_fub_ids: frozenset[int] = frozenset()
         # Marker IDs (type-2 element ref_ids) referenced in a plan as of the last parse_config
         # call — an unnamed marker still needs a real entity/value if it's wired somewhere (see
         # api._process_markers). Tracked here so a change triggers an immediate extra refresh
@@ -340,7 +348,20 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # cached so webhook pushes can re-render it with fresh values without re-fetching
         # the plan from Comexio; a shown snapshot clears the cache (it must not be
         # overwritten by live refreshes). Structural plan edits need a new button press.
+        # INVARIANT: only ever reassigned wholesale (to a fresh dict literal or None), never
+        # mutated in place. _async_poll_connection_values' stale-request guard compares object
+        # identity (self._preview_plan_cache is not cache) to notice a mid-await arm/disarm/
+        # switch; an in-place self._preview_plan_cache[...] = ... would keep the identity and
+        # silently defeat that guard. Re-arming the same plan still allocates a new dict.
         self._preview_plan_cache: dict[str, Any] | None = None
+        # Bumped every time the cache above is cleared (explicit stop, auto-stop, poll-failure
+        # disarm, or coordinator shutdown) OR re-armed for a different render
+        # (_update_live_preview_cache / _update_snapshot_preview_cache). async_generate_plan_preview
+        # captures this at entry and skips its cache-committing tail if it changed while the render
+        # was awaiting I/O — otherwise a stale render finishing after stop_preview() would resurrect
+        # a preview that was already told to stop, or a slow render could clobber a newer,
+        # concurrently-armed one for a different plan (#77).
+        self._preview_cache_generation: int = 0
         self._preview_refresh_cancel: Any = None
         # Stufe 2: last fetched {connection_id: value} for the armed live plan (see
         # _async_poll_connection_values) and the timer driving that poll. Cleared/stopped
@@ -812,9 +833,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # marker/KNX object (missing_items etc.); this only checks the separate
             # Marker+Flanke self-reset construct, shared verbatim by KNX triggers.
             trigger_ids_by_ref = self._trigger_ids_by_ref(final_data)
-            function_plan_trigger_missing_by_ref, function_plan_trigger_orphan_by_ref = self._audit_all_trigger_pairs(
-                trigger_ids_by_ref
-            )
+            trigger_audit_result = self._audit_all_trigger_pairs(trigger_ids_by_ref)
+            if trigger_audit_result is None:
+                # Trigger plan exists but its data has not landed in the bulk snapshot yet —
+                # defer the whole trigger check to the next cycle rather than misread an
+                # unloaded plan as "every trigger source unwired" (same partial-snapshot
+                # guard #78 added for the generic Web-IO wiring check).
+                self._lp_missing_recheck_pending = True
+                trigger_audit_result = ({}, {})
+            function_plan_trigger_missing_by_ref, function_plan_trigger_orphan_by_ref = trigger_audit_result
             for ref_type, ids in function_plan_trigger_missing_by_ref.items():
                 prefix = category_by_fub_module_type(ref_type).audit_key_prefix
                 for mid in ids:
@@ -1051,9 +1078,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # keeping the comparison anchored to what entities were actually built from.
             new_referenced_markers = self._referenced_marker_ids() or set()
             markers_changed = new_referenced_markers != self._last_referenced_marker_ids
-            if self._lp_missing_recheck_pending or markers_changed:
-                # The audit skipped the function_plan_missing check because the snapshot was
-                # not loaded yet — re-run it now that wiring data is available.
+            snapshot_fub_ids = frozenset(plans.keys())
+            snapshot_changed = snapshot_fub_ids != self._last_bulk_snapshot_fub_ids
+            self._last_bulk_snapshot_fub_ids = snapshot_fub_ids
+            if (self._lp_missing_recheck_pending and snapshot_changed) or markers_changed:
+                # The audit skipped the function_plan_missing check because a relevant plan
+                # wasn't loaded yet — re-run it now that the snapshot actually changed. Gating
+                # on snapshot_changed (not just the pending flag) keeps a relevant plan that the
+                # bulk endpoint can never deliver (e.g. a persistently malformed entry) from
+                # retriggering this refresh every single cycle forever.
                 self._lp_missing_recheck_pending = False
                 await self.async_request_refresh()
             fub_data = self.api.fub_data
@@ -1363,6 +1396,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         label maps so a historical snapshot shows the names it had at capture time rather
         than today's (possibly since-renamed) live names. None for a live render.
         """
+        cache_generation_before = self._preview_cache_generation
         markers_by_id, webio_by_id, ios_by_id = self._resolve_preview_label_maps(label_metadata)
         catalog = await self.function_plan_catalog.async_get_catalog()
         title_suffix, canvas = self._build_preview_title_and_canvas(fub_id)
@@ -1402,12 +1436,24 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "source": source,
             "generated_at": dt_util.utcnow().isoformat(),
         }
-        if source == "live":
-            self._update_live_preview_cache(fub_id, plan_name, elements, connections, plan_switched)
+        # The preview may have been stopped (or auto-stopped, disarmed after repeated poll
+        # failures, shut down, or re-armed by a concurrent render for a different plan) while
+        # the awaits above were in flight — committing the cache now would resurrect a preview
+        # that was explicitly told to stop, or clobber a newer render with a stale one (#77).
+        # The already-written SVG/last_plan_preview above stay as the last rendered frame
+        # either way; only the re-arming is skipped.
+        if cache_generation_before == self._preview_cache_generation:
+            if source == "live":
+                self._update_live_preview_cache(fub_id, plan_name, elements, connections, plan_switched)
+            else:
+                kind, slot = _parse_snapshot_source(source)
+                self._update_snapshot_preview_cache(
+                    fub_id, plan_name, elements, connections, kind, slot, label_metadata, live_id_map
+                )
         else:
-            kind, slot = _parse_snapshot_source(source)
-            self._update_snapshot_preview_cache(
-                fub_id, plan_name, elements, connections, kind, slot, label_metadata, live_id_map
+            _LOGGER.debug(
+                "[%s] Plan preview cache commit skipped: cache generation changed while rendering",
+                self.server_id,
             )
         self.async_set_updated_data(self.data)
         return f"/local/{filename}"
@@ -1496,6 +1542,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "label_metadata": None,
             "live_id_map": None,
         }
+        self._preview_cache_generation += 1
         if plan_switched:
             self._restart_connection_poll(fast=self._connection_poll_fast_requested)
             self._preview_auto_stop_minutes = _PREVIEW_AUTO_STOP_DEFAULT_MINUTES
@@ -1534,6 +1581,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "label_metadata": label_metadata,
             "live_id_map": live_id_map,
         }
+        self._preview_cache_generation += 1
         if not already_armed:
             self._restart_connection_poll(fast=self._connection_poll_fast_requested)
             self._preview_auto_stop_minutes = _PREVIEW_AUTO_STOP_DEFAULT_MINUTES
@@ -1581,9 +1629,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
         try:
             await self._render_armed_preview()
         except Exception:
-            # Disable further refreshes; the next preview button press re-arms.
-            self._preview_plan_cache = None
+            # Log before cleanup: a failure inside _disarm_preview_cache()/_stop_connection_poll()
+            # (both synchronous, no I/O, but not provably infallible) must never mask the actual
+            # render failure's traceback.
             _LOGGER.exception("[%s] Plan preview refresh failed", self.server_id)
+            # Disable further refreshes; the next preview button press re-arms. Also stop the
+            # Stufe-2 connection-value poll — otherwise its timer keeps firing indefinitely as a
+            # no-op against an already-cleared cache (#77).
+            self._disarm_preview_cache()
+            self._stop_connection_poll()
 
     def _restart_connection_poll(self, fast: bool) -> None:
         """(Re)start the Stufe-2 connection-value poll at the given cadence.
@@ -1606,6 +1660,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
             self._preview_auto_stop_cancel()
             self._preview_auto_stop_cancel = None
         self._connection_values = {}
+        # stop_preview() now runs this on every routine view switch (#75), not just rare
+        # true removals — reset here so a transient failure streak doesn't carry into the
+        # next arm and trip the breaker after fewer than _CONNECTION_POLL_MAX_FAILURES.
+        self._connection_poll_fail_count = 0
 
     def _restart_preview_auto_stop(self) -> None:
         """(Re)arm the auto-stop timer at the currently requested duration.
@@ -1633,7 +1691,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             f"Live-Poll nach {self._preview_auto_stop_minutes} Minuten automatisch gestoppt — "
             "Plan erneut öffnen, um ihn fortzusetzen"
         )
-        self._preview_plan_cache = None
+        self._disarm_preview_cache()
         self._stop_connection_poll()
 
     def set_preview_auto_stop_extension(self, minutes: int) -> bool:
@@ -1646,6 +1704,30 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return False
         self._preview_auto_stop_minutes = minutes
         self._restart_preview_auto_stop()
+        return True
+
+    def _disarm_preview_cache(self) -> None:
+        """Clear the armed-preview cache and bump _preview_cache_generation (see its docstring).
+
+        Shared by every disarm path (explicit stop, auto-stop, refresh/poll failure, coordinator
+        shutdown) so none of them can forget the generation bump and reintroduce the
+        stale-render race (#77).
+        """
+        self._preview_plan_cache = None
+        self._preview_cache_generation += 1
+
+    def stop_preview(self) -> bool:
+        """Disarm the currently armed preview immediately (function_plan_preview_stop service).
+
+        Called by the plan card's disconnectedCallback when it leaves the DOM (page
+        navigation/close), so the Stufe-2 poll stops right away instead of continuing until
+        _PREVIEW_AUTO_STOP_DEFAULT_MINUTES elapses (#75). No-op (returns False) while nothing
+        is armed, same convention as set_preview_auto_stop_extension.
+        """
+        if self._preview_plan_cache is None:
+            return False
+        self._disarm_preview_cache()
+        self._stop_connection_poll()
         return True
 
     def set_debug_session_active(self, active: bool) -> None:
@@ -1669,10 +1751,17 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return
         try:
             preview_session = await self.api.ensure_preview_session()
-            self._connection_values = await self.api.get_function_plan_connection_values(
+            connection_values = await self.api.get_function_plan_connection_values(
                 cache["fub_id"], session=preview_session
             )
         except Exception:
+            if self._preview_plan_cache is not cache:
+                # The preview was stopped/replaced (stop_preview() or a new plan armed)
+                # while this request was in flight — its failure no longer belongs to the
+                # now-current preview's failure streak (#75). The identity compare is reliable
+                # only because the cache is always reassigned wholesale, never mutated in
+                # place (see _preview_plan_cache's definition).
+                return
             self._connection_poll_fail_count += 1
             if self._connection_poll_fail_count >= _CONNECTION_POLL_MAX_FAILURES:
                 _LOGGER.exception(
@@ -1681,7 +1770,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     self.server_id,
                     self._connection_poll_fail_count,
                 )
-                self._preview_plan_cache = None
+                self._disarm_preview_cache()
                 self._stop_connection_poll()
                 self._connection_poll_fail_count = 0
                 self._fire_plan_system_event(
@@ -1696,6 +1785,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     _CONNECTION_POLL_MAX_FAILURES,
                 )
             return
+        if self._preview_plan_cache is not cache:
+            # Stale response for a preview that's no longer armed (stopped/replaced while
+            # this request was in flight, #75) — discard it instead of overwriting the
+            # currently armed preview's fresh connection values with old data. Relies on the
+            # cache being reassigned wholesale on every (re-)arm, never mutated in place
+            # (see _preview_plan_cache's definition).
+            return
+        self._connection_values = connection_values
         self._connection_poll_fail_count = 0
         _LOGGER.debug(
             "[%s] Connection-value poll fub=%s plan=%s -> %s",
@@ -1715,6 +1812,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
         if self._preview_refresh_cancel is not None:
             self._preview_refresh_cancel()
             self._preview_refresh_cancel = None
+        # Disarm the preview cache too — otherwise a render still in flight at shutdown time
+        # (e.g. an in-progress async_generate_plan_preview) could commit its cache after
+        # HA has already moved on, one of the disarm paths missed by the original fix (#77).
+        self._disarm_preview_cache()
         await super().async_shutdown()
 
     def _fire_plan_system_event(self, message: str) -> None:
@@ -1750,6 +1851,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
     def update_marker(self, marker_id: str | int, value: float | int | str) -> None:
         marker_id_str = str(marker_id)
+        previous = self.marker_states.get(marker_id_str)
         self.marker_states[marker_id_str] = value
         self._webhook_updated_markers.add(marker_id_str)  # R1: mark as received during possible fetch
         label = f"M{marker_id_str}"
@@ -1759,6 +1861,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     m["value"] = value
                     label = m.get("name") or label
                     break
+        _LOGGER.debug(WEBHOOK_VALUE_LOG_MSG, "marker", label, value, previous)
         self.async_set_updated_data(self.data)
         self._fire_plan_event("marker", marker_id_str, label, value)
         self.schedule_plan_preview_refresh()
@@ -1788,10 +1891,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
     def update_io_by_name(self, ext_name: str, identifier: str, value: float | int | str) -> None:
         key = (ext_name.lower(), identifier.lower())
         if io := self._io_index.get(key):
+            previous = self.io_states.get(io["id"])
             self.io_states[io["id"]] = value
             io["value"] = value
             self._webhook_updated_io_ids.add(io["id"])  # R1: mark as received during possible fetch
-            self._fire_plan_event("io", str(io["id"]), io.get("name") or f"{ext_name} {identifier}", value)
+            label = io.get("name") or f"{ext_name} {identifier}"
+            _LOGGER.debug(WEBHOOK_VALUE_LOG_MSG, "io", label, value, previous)
+            self._fire_plan_event("io", str(io["id"]), label, value)
+        else:
+            _LOGGER.warning(WEBHOOK_UNKNOWN_IO_LOG_MSG, ext_name, identifier, value)
         self.async_set_updated_data(self.data)
         self.schedule_plan_preview_refresh()
 
@@ -3417,15 +3525,41 @@ class ComexioCoordinator(DataUpdateCoordinator):
             connected.update(ref_by_elem_id[eid] for eid in endpoint_ids if eid in ref_by_elem_id)
         return connected
 
+    def _relevant_plans_loaded(self, relevant_fub_ids: set[int]) -> bool:
+        """Whether every fub_id relevant to the wiring audit is already in the bulk snapshot.
+
+        Checking only "is the snapshot non-empty" is not enough: right after startup/reload
+        the backup cycle fills function_plan_plans incrementally, so a snapshot can already
+        hold some plans while a relevant one (e.g. the marker cluster plan containing a
+        marker's real Web-IO pair) has not landed yet. Treating that partial state as "ready"
+        makes _wired_source_webio_pairs/_connected_source_ids scan only the fub_ids that
+        happen to be loaded and silently miss the rest, which _function_plan_gap_item then
+        misreports as a genuinely missing wire.
+
+        relevant_fub_ids is narrowed to still-existing plans first: a fub_id can outlive its
+        plan in CONF_FUNCTION_PLAN_PLAN_MAP (deleted/renamed directly in Comexio — the same
+        stale-entry case _stale_plan_map_entries cleans up, but only on the sync-button path,
+        never here). An unnarrowed check would wait forever for a fub_id that function_plan_
+        load_all_plans() — itself filtered against fub_data — can never deliver, permanently
+        returning False and, via _lp_missing_recheck_pending, retriggering a refresh every
+        backup cycle without end. The empty-snapshot guard stays explicit so the original
+        startup race (no plans loaded yet at all) is still caught even when relevant_fub_ids
+        itself is empty (legacy CONF_FUNCTION_PLAN_FUB_ID == "auto").
+        """
+        if not self.function_plan_plans:
+            return False
+        existing_fub_ids = {int(fub_id) for fub_id in self.api.fub_data}
+        return (relevant_fub_ids & existing_fub_ids) <= self.function_plan_plans.keys()
+
     def _connected_source_ids(self, source_type: str) -> set[str] | None:
         """ref_ids of `source_type` elements with ANY connection at all, across every plan
         relevant to the wiring audit — see _plan_connected_source_ids. Mirrors
         _wired_source_webio_pairs' scoping (same relevant_fub_ids, same None-while-not-loaded
         contract) since both feed the same audit cycle.
         """
-        if not self.function_plan_plans:
-            return None
         relevant_fub_ids = self._function_plan_check_fub_ids()
+        if not self._relevant_plans_loaded(relevant_fub_ids):
+            return None
         connected: set[str] = set()
         for fub_id, plan_data in self.function_plan_plans.items():
             if fub_id in relevant_fub_ids:
@@ -3436,8 +3570,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
         """Return (ref_id, webIoId) pairs of source elements (marker "2" / IO "1") directly
         wired to a WebIO element in a managed plan.
 
-        Built from the bulk snapshot of the backup cycle; returns None while that snapshot is
-        not loaded yet. A pair only counts as wired when the source element and the WebIO
+        Built from the bulk snapshot of the backup cycle; returns None while any plan relevant
+        to the audit (see _function_plan_check_fub_ids) is not loaded into that snapshot yet,
+        including a partially-populated snapshot missing just one of them. A pair only counts
+        as wired when the source element and the WebIO
         (type-10) element are endpoints of the SAME connection — merely having the WebIO
         ref_id appear in some unrelated connection is not enough. ref_ids are device-local and
         the server assigns them globally increasing only "in practice", so a stray element of
@@ -3451,9 +3587,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
         plan is, and scanning it too would mask a real gap in the managed plan as "wired
         elsewhere".
         """
-        if not self.function_plan_plans:
-            return None
         relevant_fub_ids = self._function_plan_check_fub_ids()
+        if not self._relevant_plans_loaded(relevant_fub_ids):
+            return None
         pairs: set[tuple[str, str]] = set()
         for fub_id, plan_data in self.function_plan_plans.items():
             if fub_id in relevant_fub_ids:
@@ -3685,20 +3821,30 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
     def _audit_all_trigger_pairs(
         self, trigger_ids_by_ref: dict[int, list[int]]
-    ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    ) -> tuple[dict[int, list[int]], dict[int, list[int]]] | None:
         """Run _audit_trigger_pairs once per source category, collecting the non-empty
-        missing/orphan id lists keyed by ref_type."""
+        missing/orphan id lists keyed by ref_type.
+
+        Returns None as soon as one per-category audit signals "trigger plan exists but is
+        not in the bulk snapshot yet" — the caller then defers the whole trigger check to
+        the next cycle instead of acting on a partial picture.
+        """
         missing_by_ref: dict[int, list[int]] = {}
         orphan_by_ref: dict[int, list[int]] = {}
         for ref_type, ids in trigger_ids_by_ref.items():
-            missing_ids, orphan_ids = self._audit_trigger_pairs(ids, ref_type)
+            result = self._audit_trigger_pairs(ids, ref_type)
+            if result is None:
+                return None
+            missing_ids, orphan_ids = result
             if missing_ids:
                 missing_by_ref[ref_type] = missing_ids
             if orphan_ids:
                 orphan_by_ref[ref_type] = orphan_ids
         return missing_by_ref, orphan_by_ref
 
-    def _audit_trigger_pairs(self, trigger_marker_ids: list[int], ref_type: int = 2) -> tuple[list[int], list[int]]:
+    def _audit_trigger_pairs(
+        self, trigger_marker_ids: list[int], ref_type: int = 2
+    ) -> tuple[list[int], list[int]] | None:
         """Compare trigger sources ([TRIG]/[TP]) of one category (ref_type) against the
         dedicated trigger plan's wiring.
 
@@ -3722,14 +3868,22 @@ class ComexioCoordinator(DataUpdateCoordinator):
         KNX, unverified against real KNX plan data) — marker and KNX ids share the same numeric
         space, so a single merged call could not tell them apart. Mirrors the per-category
         _dangling_source_ids pattern above.
+
+        Returns None while the trigger plan's fub_id is a confirmed existing plan that simply
+        has not landed in the bulk snapshot yet (same partial-snapshot startup/reload window
+        _relevant_plans_loaded guards against for the generic Web-IO wiring check) — otherwise
+        an unloaded-but-real plan would read as "zero wired pairs" and misreport every trigger
+        source as missing until the next poll.
         """
         raw_map = self.config_entry.options.get(CONF_FUNCTION_PLAN_PLAN_MAP, {})
         plan_map = {k: int(v) for k, v in raw_map.items()} if isinstance(raw_map, dict) else {}
         fub_id = plan_map.get(FUNCTION_PLAN_TRIGGER_PLAN_NAME)
         if fub_id is None or self.api.fub_data.get(str(fub_id), {}).get("Name") != FUNCTION_PLAN_TRIGGER_PLAN_NAME:
             return list(trigger_marker_ids), []
+        if fub_id not in self.function_plan_plans:
+            return None
 
-        plan_data = self.function_plan_plans.get(fub_id)
+        plan_data = self.function_plan_plans[fub_id]
         existing_by_ref, _ = self.api._function_plan_existing_refs(plan_data)
         all_marker_ids = {ref_id for rt, ref_id in existing_by_ref if rt == ref_type}
         wired_marker_ids = self.api._function_plan_trigger_wired_marker_ids(plan_data, ref_type)
@@ -3751,12 +3905,16 @@ class ComexioCoordinator(DataUpdateCoordinator):
         needs something to be suffixed to), so it's never affected by the referenced-marker
         cold-start fallback that only concerns unnamed markers.
 
-        get_raw_config() returns {} on an HTTP failure rather than raising — indistinguishable
         from a genuinely empty config by shape alone. Proceeding anyway would derive empty
         trigger id lists and make _audit_trigger_pairs() read every existing source element
         in the trigger plan as orphaned, deleting valid self-reset pairs over what was really
         just a transient fetch failure. So an empty result skips the audit entirely
         ({}, {} — a safe no-op); the next successful poll or sync retries it.
+
+        _audit_all_trigger_pairs() can itself return None (trigger plan exists but its data
+        hasn't landed in the bulk snapshot yet) — treated the same safe-no-op way here, since
+        this caller (button.py, mid-sync) has no non-blocking way to force that snapshot to
+        refresh and must not misread "not loaded yet" as "plan is empty, everything's orphaned."
         """
         raw_config = await self.api.get_raw_config()
         if not raw_config:
@@ -3775,7 +3933,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
         for cls, cat in SOURCE_CATEGORIES.items():
             if cls not in active:
                 parsed[cat.data_key] = []
-        return self._audit_all_trigger_pairs(self._trigger_ids_by_ref(parsed))
+        trigger_audit_result = self._audit_all_trigger_pairs(self._trigger_ids_by_ref(parsed))
+        if trigger_audit_result is None:
+            _LOGGER.warning(
+                "[%s] Trigger re-audit: trigger plan not yet in the bulk snapshot — skipping "
+                "this sync's trigger-pair check, will retry on the next poll",
+                self.server_id,
+            )
+            return {}, {}
+        return trigger_audit_result
 
     def _function_plan_missing_eta_sec(self, missing_items: list[dict]) -> int:
         """Estimate the duration of the add-pairs repair action in seconds.
