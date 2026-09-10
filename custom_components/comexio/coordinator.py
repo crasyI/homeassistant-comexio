@@ -206,11 +206,14 @@ def _plan_ref_ids(elements: dict[str, Any]) -> tuple[set[str], set[str], set[str
     knx_ids: set[str] = set()
     for elem in elements.values():
         ref = elem.get("reference") or {}
-        if ref.get("type") == 2:
+        # Comexio encodes reference.type as int or string depending on the response shape —
+        # normalize like every other ref.type check in this codebase (_function_plan_existing_refs
+        # et al.); a bare int compare would silently drop string-typed refs.
+        if str(ref.get("type")) == "2":
             marker_ids.add(str(ref.get("ref_id")))
-        elif ref.get("type") == 1:
+        elif str(ref.get("type")) == "1":
             io_ids.add(str(ref.get("ref_id")))
-        elif ref.get("type") == 11:  # blind guess: KNX objects use $FubModules key "11"
+        elif str(ref.get("type")) == "11":  # blind guess: KNX objects use $FubModules key "11"
             knx_ids.add(str(ref.get("ref_id")))
     return marker_ids, io_ids, knx_ids
 
