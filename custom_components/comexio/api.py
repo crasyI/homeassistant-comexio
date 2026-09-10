@@ -1199,12 +1199,19 @@ class ComexioAPI:
         return None
 
     async def get_webio_device_info(self, device_name: str) -> str | None:
-        """Checks instance existence via HTML tabs."""
+        """Checks instance existence via HTML tabs.
+
+        Returns the tab's device id, or `None` if `device_name` genuinely has no tab in a
+        successfully-fetched page. A failed fetch raises instead of returning `None` — callers
+        use `None` to mean "device absent" and force a destructive recreate on that basis
+        (see button.py's `_decide_effective_action`), so silently reporting "absent" here on a
+        transient HTTP error would delete-and-reupload a class that is actually still present.
+        """
         url_home = f"{self._base_url}/admin/web_io/home"
         async with self.session.get(url_home) as resp:
             if resp.status != 200:
                 _LOGGER.error("Failed to fetch Web-IO home page (HTTP %s)", resp.status)
-                return None
+                raise RuntimeError(f"Failed to fetch Web-IO home page (HTTP {resp.status})")
             html = await resp.text()
             pattern = rf'<a id="tab-link-(\d+)"[^>]*>{re.escape(device_name)}</a>'
             return m[1] if (m := re.search(pattern, html, re.IGNORECASE)) else None
