@@ -488,6 +488,18 @@ class ComexioCoordinator(DataUpdateCoordinator):
             for k in final_data["knx"]:
                 k["value"] = self.knx_states.get(k["id"], k["value"])
 
+            # Prune knx_states down to the object ids the server still reports. marker_states /
+            # io_states are self-correcting — the loops above overwrite every cached entry with a
+            # fresh authoritative poll value each cycle — but knx_states is webhook-only, so a
+            # value cached for a since-deleted KNX object would otherwise linger forever and be
+            # inherited by a different object that later reuses the same numeric id. Keyed off
+            # parsed_data (not final_data) so the cache stays correct even while import_knx is
+            # off, and gated on a non-empty scrape (get_raw_config returns {} on a transient
+            # HTTP failure — pruning then would wipe every cached value over a blip).
+            if raw_config.get("FubModules"):
+                known_knx_ids = {k["id"] for k in parsed_data.get("knx", [])}
+                self.knx_states = {kid: v for kid, v in self.knx_states.items() if kid in known_knx_ids}
+
             # Rebuild O(1) lookup index for webhook IO updates
             self._io_index = {(io["ext_name"].lower(), io["identifier"].lower()): io for io in final_data["io"]}
 
