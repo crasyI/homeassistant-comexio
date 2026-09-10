@@ -45,7 +45,6 @@ from .const import (
     CONF_FUNCTION_PLAN_PLAN_MAP,
     CONF_FUNCTION_PLAN_PLAN_PREFIX,
     CONF_HOST,
-    CONF_IGNORED_MARKERS,
     CONF_PASSWORD,
     CONF_SERVER_ID,
     CONF_STATISTICS_CLEANUP_IGNORED,
@@ -84,24 +83,32 @@ from .const import (
     RANGE_CHECK_FAILED,
     RANGE_CHECK_FIXED,
     RANGE_CHECK_SKIPPED,
+    SOURCE_CATEGORIES,
     SYNC_DURATION_FUNCTION_PLAN_ELEMENT,
     SYNC_DURATION_FUNCTION_PLAN_FINALIZE,
     WATCHDOG_HISTORY_MAX_ENTRIES,
     WEBHOOK_UNKNOWN_IO_LOG_MSG,
     WEBHOOK_VALUE_LOG_MSG,
     WEBIO_CLASS_IO,
+    WEBIO_CLASS_KNX,
     WEBIO_CLASS_MARKER,
     WEBIO_CLASSES,
     WEBIO_RANGE_CHECK_HOUR,
     WEBIO_RANGE_CHECK_MINUTE,
     MarkerKind,
+    WebioClass,
+    active_webio_classes,
     bus_load_signal,
+    category_by_fub_module_type,
+    classify_audit_key,
     expand_ignored_marker_ids,
     fw_update_signal,
     io_audit_key,
     io_column_rows,
-    is_io_audit_key,
     snap_to_grid,
+    source_audit_key,
+    source_category,
+    trigger_pair_categories,
     webio_class_label,
 )
 from .function_plan_backup import (
@@ -188,21 +195,41 @@ def _parse_snapshot_source(source: str) -> tuple[str, int]:
     return kind, int(slot)
 
 
-def _plan_ref_ids(elements: dict[str, Any]) -> tuple[set[str], set[str]]:
-    """marker_ids/io_ids (type-2/type-1 element refs) referenced by a plan's elements.
+def _plan_ref_ids(elements: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    """marker_ids/io_ids/knx_ids (type-2/type-1/type-11 element refs) referenced by a plan's elements.
 
     Drives _fire_plan_event's gating of the comexio_plan_event bus events (the plan card's
     debug box) — only a value push belonging to the currently-displayed plan is published.
     """
     marker_ids: set[str] = set()
     io_ids: set[str] = set()
+    knx_ids: set[str] = set()
     for elem in elements.values():
         ref = elem.get("reference") or {}
-        if ref.get("type") == 2:
+        # Comexio encodes reference.type as int or string depending on the response shape —
+        # normalize like every other ref.type check in this codebase (_function_plan_existing_refs
+        # et al.); a bare int compare would silently drop string-typed refs.
+        if str(ref.get("type")) == "2":
             marker_ids.add(str(ref.get("ref_id")))
-        elif ref.get("type") == 1:
+        elif str(ref.get("type")) == "1":
             io_ids.add(str(ref.get("ref_id")))
-    return marker_ids, io_ids
+        elif str(ref.get("type")) == "11":  # blind guess: KNX objects use $FubModules key "11"
+            knx_ids.add(str(ref.get("ref_id")))
+    return marker_ids, io_ids, knx_ids
+
+
+def _count_by_ref(by_ref: dict[int, list[int]]) -> int:
+    """Total id count across all source categories of a per-ref_type trigger-audit map."""
+    return sum(len(ids) for ids in by_ref.values())
+
+
+def _format_by_ref(by_ref: dict[int, list[int]]) -> str:
+    """Join a per-ref_type trigger-audit map to 'M<id>, K<id>, …' using each category's audit prefix."""
+    return ", ".join(
+        f"{category_by_fub_module_type(ref_type).audit_key_prefix}{mid}"
+        for ref_type, ids in by_ref.items()
+        for mid in ids
+    )
 
 
 async def _device_ip_mismatch(hass: HomeAssistant, ha_address: str, com_ip: str | None, com_dev_id: str | None) -> bool:
@@ -273,6 +300,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         self._last_referenced_marker_ids: set[str] = set()
         self.marker_states: dict[str, Any] = {}
         self.io_states: dict[str, Any] = {}
+        self.knx_states: dict[str, Any] = {}
         # O(1) lookup index for webhook updates: (ext_name_lower, identifier_lower) -> io dict
         self._io_index: dict[tuple[str, str], dict[str, Any]] = {}
         self.audit_ignored: bool = False
@@ -284,7 +312,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
         self.sync_progress_pct: int | None = None
         self.sync_current_step: str | None = None
         self.last_audit_results: dict[str, Any] = {}
-        self._cleanup_entity_ids: list[int] = []
+        # (webio_class value, source id) tuples — markers and KNX objects share a numeric id
+        # namespace, so the category tag keeps the cleanup button routing them apart.
+        self._cleanup_entity_ids: list[tuple[str, int]] = []
         self._cleanup_function_plan_count: int = 0
         self.cancel_sync: bool = False
         self.entity_id_mismatches: list[dict[str, str]] = []
@@ -307,7 +337,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # reloads anyway instead of being silently swallowed. See
         # request_options_update_without_reload().
         self._skip_next_listener_reload_options: dict[str, Any] | None = None
-        # R1: Track which markers/IOs received a webhook update during the last API fetch
+        # R1: Track which markers/IOs received a webhook update during the last API fetch.
+        # No KNX counterpart: KNX never has an authoritative freshly-parsed value to race
+        # against (see the KNX branch of the R1 merge in _async_update_data), so there is
+        # nothing for a KNX version of this set to disambiguate.
         self._webhook_updated_markers: set[str] = set()
         self._webhook_updated_io_ids: set[str] = set()
         self.last_plan_preview: dict[str, Any] | None = None
@@ -421,11 +454,13 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
             import_markers = conf.get("import_markers", True)
             import_ios = conf.get("import_ios", True)
+            import_knx = conf.get("import_knx", False)
 
             final_data = {
                 "markers": parsed_data["markers"] if import_markers else [],
                 "io": parsed_data["io"] if import_ios else [],
                 "io_all": parsed_data.get("io_all", []) if import_ios else [],
+                "knx": parsed_data.get("knx", []) if import_knx else [],
                 "webio_commands": parsed_data.get("webio_commands", {}),
                 "webio_names": parsed_data.get("webio_names", {}),
                 "webio_devices": parsed_data.get("webio_devices", {}),
@@ -446,6 +481,27 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     io["value"] = self.io_states.get(io["id"], io["value"])
                 else:
                     self.io_states[io["id"]] = io["value"]
+
+            # KNX diverges from the marker/IO pattern above: _process_knx() never receives a real
+            # live-value source (see its docstring — no known bulk live-value endpoint for KNX),
+            # so k["value"] here is always the placeholder 0, never an authoritative fresh read.
+            # The cached self.knx_states (populated exclusively by update_knx() from webhooks)
+            # must win unconditionally, or every poll silently wipes real webhook-pushed values
+            # back to 0 the instant they fall outside this poll's brief webhook-race window.
+            for k in final_data["knx"]:
+                k["value"] = self.knx_states.get(k["id"], k["value"])
+
+            # Prune knx_states down to the object ids the server still reports. marker_states /
+            # io_states are self-correcting — the loops above overwrite every cached entry with a
+            # fresh authoritative poll value each cycle — but knx_states is webhook-only, so a
+            # value cached for a since-deleted KNX object would otherwise linger forever and be
+            # inherited by a different object that later reuses the same numeric id. Keyed off
+            # parsed_data (not final_data) so the cache stays correct even while import_knx is
+            # off, and gated on a non-empty scrape (get_raw_config returns {} on a transient
+            # HTTP failure — pruning then would wipe every cached value over a blip).
+            if raw_config.get("FubModules"):
+                known_knx_ids = {k["id"] for k in parsed_data.get("knx", [])}
+                self.knx_states = {kid: v for kid, v in self.knx_states.items() if kid in known_knx_ids}
 
             # Rebuild O(1) lookup index for webhook IO updates
             self._io_index = {(io["ext_name"].lower(), io["identifier"].lower()): io for io in final_data["io"]}
@@ -481,27 +537,36 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # --- ORPHANED STATISTICS DETECTION ---
             await self.async_check_orphaned_statistics(conf)
 
-            # --- IGNORED MARKERS AUDIT ---
+            # --- IGNORED SOURCES AUDIT (markers=2/KNX=11, registry-driven) ---
+            # Reset the shared cleanup accumulator once per cycle; each wrapper below extends it
+            # rather than overwriting, so neither category's contribution clobbers the other's.
+            self._cleanup_entity_ids = []
+            self._cleanup_function_plan_count = 0
             await self.async_check_ignored_markers(conf, final_data)
+            await self.async_check_ignored_knx(conf, final_data)
 
             # --- SMART AUDIT LOGIC ---
             com_commands = final_data["webio_commands"]
 
-            # 1. HA Map: Markers
-            # Ignored markers are intentionally excluded from the Web-IO/Function Plan sync
-            # (see CONF_IGNORED_MARKERS) — leaving them in would make the audit report them as
-            # permanently "missing" and let Full Sync / create_missing actually create and wire
-            # Web-IO commands for markers the user explicitly opted out of.
-            ignored_marker_ids = self.ignored_marker_ids
+            # 1. HA Map: Markers + KNX objects (registry-driven over range_clustered categories)
+            # Ignored ids are intentionally excluded from the Web-IO/Function Plan sync (see
+            # CONF_IGNORED_MARKERS/CONF_IGNORED_KNX) — leaving them in would make the audit
+            # report them as permanently "missing" and let Full Sync / create_missing actually
+            # create and wire Web-IO commands for sources the user explicitly opted out of.
             ha_map = {}
-            for m in final_data["markers"]:
-                if int(m["id"]) in ignored_marker_ids:
+            for cat in SOURCE_CATEGORIES.values():
+                if not cat.range_clustered:
                     continue
-                ha_map[f"M{m['id']}"] = {
-                    "name": f"HA {m['name']}",
-                    "type": m["type"],  # Trusting the preprocessing of api.py
-                }
-            # 2. HA Map: IOs
+                ignored_ids = self.ignored_ids_for(cat.key)
+                for item in final_data[cat.data_key]:
+                    if int(item["id"]) in ignored_ids:
+                        continue
+                    ha_map[source_audit_key(cat, item["id"])] = {
+                        "name": f"HA {item['name']}",
+                        "type": item["type"],  # Trusting the preprocessing of api.py
+                    }
+
+            # 2. HA Map: IOs (own composite ext_name+identifier key shape, kept as its own block)
             io_meta_by_key: dict[str, dict[str, Any]] = {}
             for io in final_data["io"]:
                 key = io_audit_key(io["ext_name"], io["identifier"])
@@ -513,7 +578,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 ha_map[key] = {"name": f"HA IO {io['ext_name']} {io['identifier']}", "type": mapped_type}
                 io_meta_by_key[key] = io
 
-            # 3. Comexio Map (Audit the counterpart on the server)
+            # 4. Comexio Map (Audit the counterpart on the server)
             # Exact reverse lookup first: ha_map's "name" values are built from the same
             # extension names that may contain spaces, so a positional full_name.split(" ")
             # would misparse "HA IO <Ext With Space> <Ident>" (parts[2] wouldn't be the whole
@@ -531,7 +596,10 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 if key == full_name:
                     parts = full_name.split(" ")
                     if len(parts) >= 3:
-                        if parts[1].startswith("M"):
+                        if parts[1].startswith("K"):
+                            # KNX object identification via "HA K<ID> <Name>"
+                            key = parts[1]
+                        elif parts[1].startswith("M"):
                             # Marker identification via "HA M<ID> <Name>"
                             key = parts[1]
                         elif parts[1] == "IO" and len(parts) >= 4:
@@ -557,7 +625,13 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # normal sync_mismatch flow below would otherwise try to save_single_command
             # against a dev_id of None for that class.
             webio_devices = parsed_data.get("webio_devices", {})
-            missing_classes = [cls for cls in WEBIO_CLASSES if not webio_devices.get(cls, {}).get("device_id")]
+            # Only classes the user has opted into (import_conf_key) count as "missing" — an
+            # opted-out category (e.g. KNX by default) has no Web-IO device on the server by
+            # design, and flagging that as missing would wipe last_audit_results on every poll
+            # (see active_webio_classes docstring).
+            missing_classes = [
+                cls for cls in active_webio_classes(conf) if not webio_devices.get(cls, {}).get("device_id")
+            ]
             if missing_classes:
                 is_ignored = conf.get("audit_ignored", False)
                 self.last_audit_results = {}
@@ -586,7 +660,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # Prepare payload map for future delta updates via button/repairs
             payload_map = {
                 cmd["Name"]: cmd
-                for cmd in self.api.build_webio_commands(self.server_id, final_data, None, ignored_marker_ids)
+                for cmd in self.api.build_webio_commands(
+                    self.server_id, final_data, None, self.ignored_marker_ids, self.ignored_knx_ids
+                )
             }
 
             # --- IP/Port Audit --- (checked independently per Web-IO class — marker and IO
@@ -627,9 +703,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # online the next poll flags any remaining gaps again.
             managed_io_exts: set[str] = set(self.config_entry.options.get(CONF_FUNCTION_PLAN_IO_EXTENSIONS, []))
             managed_io_exts -= self.offline_extensions or set()
-            wired_marker_webio_pairs, wired_io_webio_pairs, connected_marker_ids, connected_io_ids = (
-                self._audit_wired_pairs(has_active_plan, managed_io_exts)
-            )
+            (
+                wired_marker_webio_pairs,
+                wired_io_webio_pairs,
+                wired_knx_webio_pairs,
+                connected_marker_ids,
+                connected_io_ids,
+                connected_knx_ids,
+            ) = self._audit_wired_pairs(has_active_plan, managed_io_exts)
 
             # Compare HA entities with Comexio commands to find inconsistencies
             type_mismatches: list[dict[str, Any]] = []
@@ -644,7 +725,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
             # Check for missing, renamed or type-mismatched items
             for key, ha in ha_map.items():
-                key_class = WEBIO_CLASS_IO if is_io_audit_key(key) else WEBIO_CLASS_MARKER
+                key_class = classify_audit_key(key)
                 if key not in com_map:
                     missing_items.append(
                         {"name": ha["name"], "payload": payload_map.get(ha["name"]), "webio_class": key_class}
@@ -698,7 +779,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
                             key,
                             ha["name"],
                             best_match,
-                            (wired_marker_webio_pairs, wired_io_webio_pairs),
+                            (wired_marker_webio_pairs, wired_io_webio_pairs, wired_knx_webio_pairs),
                             io_meta_by_key.get(key),
                             managed_io_exts,
                         )
@@ -738,6 +819,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             # removing the wired source element — invisible to every check above since those
             # all pivot on webio_commands/ha_map, never the raw plan elements themselves.
             markers_by_id = {str(m["id"]): m["name"] for m in final_data["markers"]}
+            knx_by_id = {str(k["id"]): k["name"] for k in final_data["knx"]}
             # io_all (not "io"): inactive IOs are excluded from "io" but can still sit as
             # debris in a plan (e.g. the extension was deactivated after the wiring was cut),
             # so resolving against "io" alone silently fell back to a bare "IO#<ref_id>" label.
@@ -749,6 +831,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
                         {"name": markers_by_id.get(rid, f"M{rid}"), "ref_id": rid, "webio_class": WEBIO_CLASS_MARKER}
                     )
                     mismatches.add(f"function_plan_dangling_M{rid}")
+                for rid in self._dangling_source_ids("11", wired_knx_webio_pairs, connected_knx_ids):
+                    function_plan_dangling_items.append(
+                        {"name": knx_by_id.get(rid, f"K{rid}"), "ref_id": rid, "webio_class": WEBIO_CLASS_KNX}
+                    )
+                    mismatches.add(f"function_plan_dangling_K{rid}")
             if managed_io_exts:
                 for rid in self._dangling_source_ids("1", wired_io_webio_pairs, connected_io_ids):
                     io = io_by_id.get(rid)
@@ -756,19 +843,28 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     function_plan_dangling_items.append({"name": name, "ref_id": rid, "webio_class": WEBIO_CLASS_IO})
                     mismatches.add(f"function_plan_dangling_IO{rid}")
 
-            # Trigger markers ([TRIG]/[TP]): independent of the Web-IO comparison above — the
-            # marker's own Web-IO wiring is audited exactly like any other marker (missing_items
-            # etc.); this only checks the separate Marker+Flanke self-reset construct.
-            trigger_marker_ids = [int(m["id"]) for m in final_data["markers"] if m.get("kind") == MarkerKind.TRIGGER]
-            trigger_audit_result = self._audit_trigger_pairs(trigger_marker_ids)
+            # Trigger markers/KNX objects ([TRIG]/[TP]): independent of the Web-IO comparison
+            # above — the source's own Web-IO wiring is audited exactly like any other
+            # marker/KNX object (missing_items etc.); this only checks the separate
+            # Marker+Flanke self-reset construct, shared verbatim by KNX triggers.
+            trigger_ids_by_ref = self._trigger_ids_by_ref(final_data)
+            trigger_audit_result = self._audit_all_trigger_pairs(trigger_ids_by_ref)
             if trigger_audit_result is None:
+                # Trigger plan exists but its data has not landed in the bulk snapshot yet —
+                # defer the whole trigger check to the next cycle rather than misread an
+                # unloaded plan as "every trigger source unwired" (same partial-snapshot
+                # guard #78 added for the generic Web-IO wiring check).
                 self._lp_missing_recheck_pending = True
-                trigger_audit_result = ([], [])
-            function_plan_trigger_missing_ids, function_plan_trigger_orphan_ids = trigger_audit_result
-            for mid in function_plan_trigger_missing_ids:
-                mismatches.add(f"function_plan_trigger_missing_M{mid}")
-            for mid in function_plan_trigger_orphan_ids:
-                mismatches.add(f"function_plan_trigger_orphan_M{mid}")
+                trigger_audit_result = ({}, {})
+            function_plan_trigger_missing_by_ref, function_plan_trigger_orphan_by_ref = trigger_audit_result
+            for ref_type, ids in function_plan_trigger_missing_by_ref.items():
+                prefix = category_by_fub_module_type(ref_type).audit_key_prefix
+                for mid in ids:
+                    mismatches.add(f"function_plan_trigger_missing_{prefix}{mid}")
+            for ref_type, ids in function_plan_trigger_orphan_by_ref.items():
+                prefix = category_by_fub_module_type(ref_type).audit_key_prefix
+                for mid in ids:
+                    mismatches.add(f"function_plan_trigger_orphan_{prefix}{mid}")
 
             self.last_audit_results = {
                 "type": type_mismatches,
@@ -782,13 +878,13 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 "cleanup_function_plan_count": self._cleanup_function_plan_count,
                 "function_plan_missing": function_plan_missing_items,
                 "function_plan_dangling": function_plan_dangling_items,
-                "function_plan_trigger_missing": function_plan_trigger_missing_ids,
-                "function_plan_trigger_orphan": function_plan_trigger_orphan_ids,
+                "function_plan_trigger_missing": function_plan_trigger_missing_by_ref,
+                "function_plan_trigger_orphan": function_plan_trigger_orphan_by_ref,
             }
 
-            # Include pending entity cleanups (ignored markers with remaining HA entities) in mismatches
-            for mid in self._cleanup_entity_ids:
-                mismatches.add(f"cleanup_entity_{mid}")
+            # Include pending entity cleanups (ignored markers/KNX with remaining HA entities) in mismatches
+            for cls_val, mid in self._cleanup_entity_ids:
+                mismatches.add(f"cleanup_entity_{cls_val}_{mid}")
 
             # 📈 --- AUDIT SUMMARY LOGGING ---
             if mismatches:
@@ -796,8 +892,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 current_summary_content = (
                     f"{len(type_mismatches)}-{len(missing_items)}-{len(renamed_items)}"
                     f"-{len(orphans)}-{ip_mismatch}-{len(function_plan_missing_items)}"
-                    f"-{len(function_plan_dangling_items)}-{len(function_plan_trigger_missing_ids)}"
-                    f"-{len(function_plan_trigger_orphan_ids)}"
+                    f"-{len(function_plan_dangling_items)}-{_count_by_ref(function_plan_trigger_missing_by_ref)}"
+                    f"-{_count_by_ref(function_plan_trigger_orphan_by_ref)}"
                 )
 
                 # Only log details if the audit result differs from the previous run
@@ -816,8 +912,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
                         len(orphans),
                         1 if ip_mismatch else 0,
                         len(function_plan_dangling_items),
-                        len(function_plan_trigger_missing_ids),
-                        len(function_plan_trigger_orphan_ids),
+                        _count_by_ref(function_plan_trigger_missing_by_ref),
+                        _count_by_ref(function_plan_trigger_orphan_by_ref),
                     )
                     if ip_mismatch:
                         mismatched = {cls: v["device_ip"] for cls, v in webio_device_audit.items() if v["ip_mismatch"]}
@@ -853,20 +949,20 @@ class ComexioCoordinator(DataUpdateCoordinator):
                         for item in function_plan_dangling_items:
                             _LOGGER.info("   -> %s", item["name"])
 
-                    if function_plan_trigger_missing_ids:
+                    if function_plan_trigger_missing_by_ref:
                         _LOGGER.info(
                             "%s Trigger markers not wired (%d): %s",
                             ICON_LINK,
-                            len(function_plan_trigger_missing_ids),
-                            ", ".join(f"M{mid}" for mid in function_plan_trigger_missing_ids),
+                            _count_by_ref(function_plan_trigger_missing_by_ref),
+                            _format_by_ref(function_plan_trigger_missing_by_ref),
                         )
 
-                    if function_plan_trigger_orphan_ids:
+                    if function_plan_trigger_orphan_by_ref:
                         _LOGGER.info(
                             "%s Orphaned trigger constructs (%d): %s",
                             ICON_DELETE,
-                            len(function_plan_trigger_orphan_ids),
-                            ", ".join(f"M{mid}" for mid in function_plan_trigger_orphan_ids),
+                            _count_by_ref(function_plan_trigger_orphan_by_ref),
+                            _format_by_ref(function_plan_trigger_orphan_by_ref),
                         )
 
                     if ip_mismatch:
@@ -899,8 +995,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
                     "function_plan_missing": len(function_plan_missing_items),
                     "function_plan_missing_eta_sec": self._function_plan_missing_eta_sec(function_plan_missing_items),
                     "function_plan_dangling": len(function_plan_dangling_items),
-                    "function_plan_trigger_missing": len(function_plan_trigger_missing_ids),
-                    "function_plan_trigger_orphan": len(function_plan_trigger_orphan_ids),
+                    "function_plan_trigger_missing": _count_by_ref(function_plan_trigger_missing_by_ref),
+                    "function_plan_trigger_orphan": _count_by_ref(function_plan_trigger_orphan_by_ref),
                     "all": len(mismatches),
                 }
 
@@ -1448,7 +1544,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         plan_switched: bool,
     ) -> None:
         """Arm the preview cache for the live plan and restart the connection poll on plan switch."""
-        marker_ids, io_ids = _plan_ref_ids(elements)
+        marker_ids, io_ids, knx_ids = _plan_ref_ids(elements)
         self._preview_plan_cache = {
             "fub_id": fub_id,
             "plan_name": plan_name,
@@ -1456,6 +1552,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "connections": connections,
             "marker_ids": marker_ids,
             "io_ids": io_ids,
+            "knx_ids": knx_ids,
             "snapshot_source": None,
             "label_metadata": None,
             "live_id_map": None,
@@ -1486,7 +1583,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
         source = f"snapshot:{kind}:{slot}"
         cache = self._preview_plan_cache
         already_armed = cache is not None and cache.get("snapshot_source") == source and cache["fub_id"] == fub_id
-        marker_ids, io_ids = _plan_ref_ids(elements)
+        marker_ids, io_ids, knx_ids = _plan_ref_ids(elements)
         self._preview_plan_cache = {
             "fub_id": fub_id,
             "plan_name": plan_name,
@@ -1494,6 +1591,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "connections": connections,
             "marker_ids": marker_ids,
             "io_ids": io_ids,
+            "knx_ids": knx_ids,
             "snapshot_source": source,
             "label_metadata": label_metadata,
             "live_id_map": live_id_map,
@@ -1783,6 +1881,28 @@ class ComexioCoordinator(DataUpdateCoordinator):
         self._fire_plan_event("marker", marker_id_str, label, value)
         self.schedule_plan_preview_refresh()
 
+    def update_knx(self, knx_id: str | int, value: float | int | str) -> None:
+        knx_id_str = str(knx_id)
+        self.knx_states[knx_id_str] = value
+        label = f"K{knx_id_str}"
+        if self.data and "knx" in self.data:
+            for k in self.data["knx"]:
+                if str(k["id"]) == knx_id_str:
+                    k["value"] = value
+                    label = k.get("name") or label
+                    break
+        self.async_set_updated_data(self.data)
+        self._fire_plan_event("knx", knx_id_str, label, value)
+        self.schedule_plan_preview_refresh()
+
+    def source_states(self, source: WebioClass) -> dict[str, Any]:
+        """Live value cache for a marker-like source category (registry-driven: markers/KNX)."""
+        return self.knx_states if source == WebioClass.KNX else self.marker_states
+
+    def update_source(self, source: WebioClass, source_id: str | int, value: float | int | str) -> None:
+        """Dispatch an optimistic value update to the right per-category cache updater."""
+        (self.update_knx if source == WebioClass.KNX else self.update_marker)(source_id, value)
+
     def update_io_by_name(self, ext_name: str, identifier: str, value: float | int | str) -> None:
         key = (ext_name.lower(), identifier.lower())
         if io := self._io_index.get(key):
@@ -2037,7 +2157,9 @@ class ComexioCoordinator(DataUpdateCoordinator):
             webio_devices = self.data.get("webio_devices", {})
             target_by_name = {
                 cmd["Name"]: cmd
-                for cmd in self.api.build_webio_commands(self.server_id, self.data, None, self.ignored_marker_ids)
+                for cmd in self.api.build_webio_commands(
+                    self.server_id, self.data, None, self.ignored_marker_ids, self.ignored_knx_ids
+                )
             }
 
             for name, cmd in webio_commands.items():
@@ -2491,90 +2613,135 @@ class ComexioCoordinator(DataUpdateCoordinator):
         self._skip_next_listener_reload_options = None
         return options
 
-    @property
-    def ignored_marker_ids(self) -> set[int]:
-        """Configured marker IDs excluded from entity creation and Web-IO command generation.
+    def _ignored_ids_for(self, category: WebioClass) -> set[int]:
+        """Configured IDs excluded from entity creation and Web-IO command generation for a category.
 
-        Parses CONF_IGNORED_MARKERS from the config entry options via
-        expand_ignored_marker_ids() (comma/semicolon/space separators, optional M/m prefix,
-        ranges like '8-12'). Returns an empty set if unset.
+        Registry-driven: resolves the option key via SourceCategory.ignored_conf_key, then
+        parses it with expand_ignored_marker_ids() (comma/semicolon/space separators, optional
+        letter prefix, ranges like '8-12'). Returns an empty set if unset or unsupported.
         """
-        ignored_raw = self.config_entry.options.get(CONF_IGNORED_MARKERS, "").strip()
+        cat = source_category(category)
+        conf_key = cat.ignored_conf_key
+        if conf_key is None:
+            return set()
+        ignored_raw = self.config_entry.options.get(conf_key, "").strip()
         if not ignored_raw:
             return set()
-        return expand_ignored_marker_ids(ignored_raw)
+        return expand_ignored_marker_ids(ignored_raw, cat.audit_key_prefix + cat.audit_key_prefix.lower())
 
-    async def async_check_ignored_markers(self, conf: dict[str, Any], final_data: dict[str, Any]) -> None:
-        """Check ignored marker IDs and manage repair issues.
+    @property
+    def ignored_marker_ids(self) -> set[int]:
+        """Configured marker IDs excluded from entity creation and Web-IO command generation."""
+        return self._ignored_ids_for(WebioClass.MARKER)
 
-        - Stale IDs (marker no longer in Comexio) are auto-removed from options + notified.
-        - Legacy IDs that still have HA entities or Function Plan links trigger a cleanup repair.
-        - IDs whose marker exists but has no entities/links are the intended normal state — no action.
+    @property
+    def ignored_knx_ids(self) -> set[int]:
+        """Configured KNX object IDs excluded from entity creation and Web-IO command generation."""
+        return self._ignored_ids_for(WebioClass.KNX)
+
+    def ignored_ids_for(self, webio_class: WebioClass) -> set[int]:
+        """Registry-driven public accessor for a category's ignore-list (markers/KNX)."""
+        return self._ignored_ids_for(webio_class)
+
+    @property
+    def active_webio_classes(self) -> tuple[WebioClass, ...]:
+        """Web-IO classes currently opted into (see active_webio_classes() in const.py)."""
+        conf = {**self.config_entry.data, **self.config_entry.options}
+        return active_webio_classes(conf)
+
+    async def async_check_ignored_sources(
+        self, conf: dict[str, Any], final_data: dict[str, Any], webio_class: WebioClass
+    ) -> None:
+        """Check ignored source IDs and manage repair issues (registry-driven: markers=2/KNX=11).
+
+        - Stale IDs (source no longer in Comexio) are auto-removed from options + notified.
+        - Legacy IDs that still have HA entities or Function Plan links extend the shared
+          self._cleanup_entity_ids / self._cleanup_function_plan_count accumulator (reset once
+          per audit cycle by the caller, see the "IGNORED SOURCES AUDIT" block above).
+        - IDs whose source exists but has no entities/links are the intended normal state — no action.
         """
-        # Clean up the legacy "invalid" issue if it still exists from a previous version
-        ir.async_delete_issue(self.hass, DOMAIN, f"ignored_markers_invalid_{self.server_id}")
-
-        ignored_raw = conf.get(CONF_IGNORED_MARKERS, "").strip()
-        if not ignored_raw:
-            self._cleanup_entity_ids = []
-            self._cleanup_function_plan_count = 0
-            ir.async_delete_issue(self.hass, DOMAIN, f"ignored_markers_cleanup_{self.server_id}")
+        category = source_category(webio_class)
+        conf_key = category.ignored_conf_key
+        if conf_key is None:
             return
 
-        markers_by_id = {int(m["id"]): m for m in final_data.get("markers", [])}
+        # Clean up the legacy "invalid" issue if it still exists from a previous version
+        ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_invalid_{self.server_id}")
+
+        # A category the user has opted out of contributes an empty final_data[data_key] by
+        # design (see _async_update_data). Running the stale-ID sweep below against that empty
+        # list would flag EVERY configured ignore-id as "no longer in Comexio" and silently wipe
+        # the user's ignore list on a mere toggle-off. The list is dormant config while the
+        # category is off — leave it untouched; the sweep resumes when it is re-enabled.
+        if webio_class not in active_webio_classes(conf):
+            ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_cleanup_{self.server_id}")
+            return
+
+        ignored_raw = conf.get(conf_key, "").strip()
+        if not ignored_raw:
+            ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_cleanup_{self.server_id}")
+            return
+
+        sources_by_id = {int(item["id"]): item for item in final_data.get(category.data_key, [])}
         stale_ids: list[int] = []
         cleanup_ids: list[int] = []
         affected_fub_ids: set[int] = set()
 
-        all_ignored_ids = expand_ignored_marker_ids(ignored_raw)
+        all_ignored_ids = expand_ignored_marker_ids(
+            ignored_raw, category.audit_key_prefix + category.audit_key_prefix.lower()
+        )
         lp_plans = await self._load_function_plan_check_data()
-        marker_ids_with_entities = set(self.marker_entities_by_id(list(all_ignored_ids)).keys())
+        ref_type = int(category.fub_module_type)
+        ids_with_entities = set(self.marker_entities_by_id(list(all_ignored_ids), category.unique_id_infix).keys())
         _LOGGER.debug(
-            "[%s] async_check_ignored_markers: ignored=%s, plans_loaded=%s",
+            "[%s] async_check_ignored_sources[%s]: ignored=%s, plans_loaded=%s",
             self.server_id,
+            category.label,
             sorted(all_ignored_ids),
             sorted(lp_plans.keys()),
         )
-        for marker_id in sorted(all_ignored_ids):
-            marker = markers_by_id.get(marker_id)
-            if not marker or not marker.get("name", "").strip():
-                # Marker no longer exists in Comexio → stale, auto-remove
-                stale_ids.append(marker_id)
+        for source_id in sorted(all_ignored_ids):
+            source = sources_by_id.get(source_id)
+            if not source or not source.get("name", "").strip():
+                # Source no longer exists in Comexio → stale, auto-remove
+                stale_ids.append(source_id)
                 continue
 
-            # Marker exists and is intentionally ignored — only flag if legacy entities/links remain
-            has_entities = marker_id in marker_ids_with_entities
-            function_plan_fub_id = self._check_marker_function_plan_link(marker_id, lp_plans)
+            # Source exists and is intentionally ignored — only flag if legacy entities/links remain
+            has_entities = source_id in ids_with_entities
+            function_plan_fub_id = self._check_marker_function_plan_link(source_id, lp_plans, ref_type)
             _LOGGER.debug(
-                "[%s] ignored marker M%s: has_entities=%s, function_plan_fub_id=%s",
+                "[%s] ignored %s%s: has_entities=%s, function_plan_fub_id=%s",
                 self.server_id,
-                marker_id,
+                category.audit_key_prefix,
+                source_id,
                 has_entities,
                 function_plan_fub_id,
             )
             if function_plan_fub_id is not None:
                 affected_fub_ids.add(function_plan_fub_id)
             if has_entities or function_plan_fub_id is not None:
-                cleanup_ids.append(marker_id)
+                cleanup_ids.append(source_id)
 
-        # Auto-remove stale IDs from options (marker deactivated/removed in Comexio)
+        # Auto-remove stale IDs from options (source deactivated/removed in Comexio)
         if stale_ids:
             new_options = {**self.config_entry.options}
             if remaining_ids := sorted(all_ignored_ids - set(stale_ids)):
-                new_options[CONF_IGNORED_MARKERS] = ",".join(str(i) for i in remaining_ids)
+                new_options[conf_key] = ",".join(str(i) for i in remaining_ids)
             else:
-                new_options.pop(CONF_IGNORED_MARKERS, None)
+                new_options.pop(conf_key, None)
             self.request_options_update_without_reload(new_options)
-            stale_str = ", ".join(f"M{mid}" for mid in stale_ids)
+            stale_str = ", ".join(f"{category.audit_key_prefix}{sid}" for sid in stale_ids)
             _LOGGER.info(
-                "[%s] Auto-removed stale ignored_markers IDs (no longer in Comexio): %s",
+                "[%s] Auto-removed stale %s IDs (no longer in Comexio): %s",
                 self.server_id,
+                conf_key,
                 stale_str,
             )
 
             # persistent_notification has no per-user language context; use English
             notif_body = (
-                f"Marker IDs **{stale_str}** were automatically removed from `ignored_markers` "
+                f"{category.label} IDs **{stale_str}** were automatically removed from `{conf_key}` "
                 "because they no longer exist in Comexio. "
                 "They will be created as entities again on the next integration restart."
             )
@@ -2582,14 +2749,22 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 self.hass,
                 notif_body,
                 title=f"Comexio ({self.server_id})",
-                notification_id=f"comexio_stale_ignored_{self.server_id}",
+                notification_id=f"comexio_stale_ignored_{webio_class.value}_{self.server_id}",
             )
 
-        # Store cleanup_ids for the combined sync_mismatch repair (no separate issue anymore)
-        self._cleanup_entity_ids = cleanup_ids
-        self._cleanup_function_plan_count = len(affected_fub_ids)
-        # Remove legacy ignored_markers_cleanup issue if it still exists from an older version
-        ir.async_delete_issue(self.hass, DOMAIN, f"ignored_markers_cleanup_{self.server_id}")
+        # Extend the shared cleanup accumulator for the combined sync_mismatch repair
+        self._cleanup_entity_ids.extend((webio_class.value, sid) for sid in cleanup_ids)
+        self._cleanup_function_plan_count += len(affected_fub_ids)
+        # Remove legacy ignored_<category>_cleanup issue if it still exists from an older version
+        ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_cleanup_{self.server_id}")
+
+    async def async_check_ignored_markers(self, conf: dict[str, Any], final_data: dict[str, Any]) -> None:
+        """Check ignored marker IDs and manage repair issues (thin wrapper, see async_check_ignored_sources)."""
+        await self.async_check_ignored_sources(conf, final_data, WebioClass.MARKER)
+
+    async def async_check_ignored_knx(self, conf: dict[str, Any], final_data: dict[str, Any]) -> None:
+        """Check ignored KNX object IDs and manage repair issues (thin wrapper, see async_check_ignored_sources)."""
+        await self.async_check_ignored_sources(conf, final_data, WebioClass.KNX)
 
     async def async_detect_orphaned_statistics(self) -> list[str]:
         """Return statistic_ids for this integration that no longer have a matching entity.
@@ -2663,16 +2838,19 @@ class ComexioCoordinator(DataUpdateCoordinator):
         _LOGGER.info("[%s] Entity ID migration complete: %d IDs updated", self.server_id, migrated)
         return migrated
 
-    def marker_entities_by_id(self, marker_ids: list[int]) -> dict[int, er.RegistryEntry]:
-        """Return registry entries for the given marker ids that still have an HA entity.
+    def marker_entities_by_id(self, marker_ids: list[int], unique_id_infix: str = "m") -> dict[int, er.RegistryEntry]:
+        """Return registry entries for the given source ids that still have an HA entity.
 
         Single pass over the registry regardless of how many marker_ids are checked, instead
         of one full registry scan per marker. Shared by the audit check (read-only) and the
         cleanup button (which also deletes the returned entries) to avoid divergent matching
-        logic between the two.
+        logic between the two. unique_id_infix distinguishes source categories sharing this
+        helper (e.g. "m" for markers, "k" for KNX objects, see SourceCategory.unique_id_infix).
         """
         ent_reg = er.async_get(self.hass)
-        marker_id_by_unique_id = {f"{DOMAIN}_{self.server_id}_m{mid}".lower(): mid for mid in marker_ids}
+        marker_id_by_unique_id = {
+            f"{DOMAIN}_{self.server_id}_{unique_id_infix}{mid}".lower(): mid for mid in marker_ids
+        }
         return {
             marker_id: entity
             for entity in ent_reg.entities.values()
@@ -2706,14 +2884,24 @@ class ComexioCoordinator(DataUpdateCoordinator):
         )
 
     @staticmethod
-    def _cluster_plan_name(marker_id: int, prefix: str, cluster_size: int) -> str:
-        """Name of the managed cluster plan a marker belongs to (deterministic bucket math)."""
-        start = ((marker_id - 1) // cluster_size) * cluster_size + 1
-        return f"{prefix} - Marker [{start}-{start + cluster_size - 1}]"
+    def _cluster_plan_name(source_id: int, prefix: str, cluster_size: int, category_label: str = "Marker") -> str:
+        """Name of the managed cluster plan a marker/KNX object belongs to (deterministic bucket math)."""
+        start = ((source_id - 1) // cluster_size) * cluster_size + 1
+        return f"{prefix} - {category_label} [{start}-{start + cluster_size - 1}]"
+
+    def expected_source_cluster_name(self, source_id: int, category_label: str = "Marker") -> str:
+        """Deterministic cluster-plan name a marker/KNX ID currently maps to (config-aware)."""
+        return self._cluster_plan_name(
+            source_id, self._function_plan_prefix(), self._function_plan_cluster_size(), category_label
+        )
 
     def expected_marker_cluster_name(self, marker_id: int) -> str:
         """Deterministic cluster-plan name a marker ID currently maps to (config-aware)."""
-        return self._cluster_plan_name(marker_id, self._function_plan_prefix(), self._function_plan_cluster_size())
+        return self.expected_source_cluster_name(marker_id, "Marker")
+
+    def expected_knx_cluster_name(self, knx_id: int) -> str:
+        """Deterministic cluster-plan name a KNX object ID currently maps to (config-aware)."""
+        return self.expected_source_cluster_name(knx_id, "KNX")
 
     def io_cluster_plan_contains(self, live_plan_name: str, ext_name: str) -> bool:
         """True if a live plan name still parses as a managed IO cluster plan naming ext_name.
@@ -2726,11 +2914,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
         members = self._io_plan_members(live_plan_name, self._function_plan_prefix())
         return members is not None and ext_name in members
 
-    async def resolve_marker_clusters(self, marker_ids: list[int]) -> tuple[dict[int, list[int]], set[int]]:
-        """Group marker IDs by cluster plan and resolve/create each plan.
+    async def resolve_marker_clusters(
+        self, marker_ids: list[int], category_label: str = "Marker"
+    ) -> tuple[dict[int, list[int]], set[int]]:
+        """Group marker/KNX IDs by cluster plan and resolve/create each plan.
 
-        Returns ({fub_id: [marker_ids_in_cluster]}, {fub_ids of freshly created plans}).
+        Returns ({fub_id: [source_ids_in_cluster]}, {fub_ids of freshly created plans}).
         Lookup order per cluster: CONF_FUNCTION_PLAN_PLAN_MAP cache → name scan → create.
+        category_label picks the plan-name category ("Marker"/"KNX") — see resolve_knx_clusters.
         """
         prefix = self._function_plan_prefix()
         cluster_size = self._function_plan_cluster_size()
@@ -2742,7 +2933,7 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
         clusters: dict[str, list[int]] = {}
         for mid in marker_ids:
-            clusters.setdefault(self._cluster_plan_name(mid, prefix, cluster_size), []).append(mid)
+            clusters.setdefault(self._cluster_plan_name(mid, prefix, cluster_size, category_label), []).append(mid)
 
         result: dict[int, list[int]] = {}
         created_plans: set[int] = set()
@@ -2762,6 +2953,11 @@ class ComexioCoordinator(DataUpdateCoordinator):
             await self._persist_plan_map(plan_map_updates, removals=set(stale))
 
         return result, created_plans
+
+    async def resolve_knx_clusters(self, knx_ids: list[int]) -> tuple[dict[int, list[int]], set[int]]:
+        """Group KNX object IDs by cluster plan and resolve/create each plan (KNX counterpart of
+        resolve_marker_clusters — same bucket math, plans named "HA - KNX [x-y]")."""
+        return await self.resolve_marker_clusters(knx_ids, category_label="KNX")
 
     async def resolve_trigger_plan(self) -> tuple[int | None, bool]:
         """Find or create the single dedicated "HA - TRIGGER" plan. Returns (fub_id, freshly_created)."""
@@ -3066,21 +3262,22 @@ class ComexioCoordinator(DataUpdateCoordinator):
         return plans
 
     async def resolve_marker_cleanup_plans(
-        self, marker_ids: list[int], preferred_fub_id: int | None = None
+        self, marker_ids: list[int], preferred_fub_id: int | None = None, ref_type: int = 2
     ) -> dict[int, list[int]]:
-        """Group markers by the managed plan they are wired in, for per-plan cleanup.
+        """Group markers/KNX objects by the managed plan they are wired in, for per-plan cleanup.
 
         A user-selected plan (preferred_fub_id) keeps the single-plan behaviour: all supplied
-        markers are grouped under it as-is, without an upfront wiring check — the per-marker
-        cleanup call itself is a no-op for any marker not actually wired there. Otherwise each
-        marker is looked up in all managed plans and unwired markers are omitted here instead.
+        ids are grouped under it as-is, without an upfront wiring check — the per-id cleanup
+        call itself is a no-op for any id not actually wired there. Otherwise each id is
+        looked up in all managed plans and unwired ones are omitted here instead. ref_type
+        selects the source category's plan-element type (marker=2, KNX=11 — blind guess).
         """
         if preferred_fub_id is not None:
             return {preferred_fub_id: list(marker_ids)}
         plans = await self._load_function_plan_check_data()
         plan_to_ids: dict[int, list[int]] = {}
         for marker_id in marker_ids:
-            fub_id = self._check_marker_function_plan_link(marker_id, plans)
+            fub_id = self._check_marker_function_plan_link(marker_id, plans, ref_type)
             if fub_id is not None and self._is_managed_function_plan(fub_id):
                 plan_to_ids.setdefault(fub_id, []).append(marker_id)
         return plan_to_ids
@@ -3224,28 +3421,30 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "touched_fub_ids": list(dict.fromkeys(touched_fub_ids)),
         }
 
-    def _check_marker_function_plan_link(self, marker_id: int, plans: dict[int, dict]) -> int | None:
-        """Check if the marker is wired in any of the pre-loaded managed plans.
+    def _check_marker_function_plan_link(self, marker_id: int, plans: dict[int, dict], ref_type: int = 2) -> int | None:
+        """Check if the source (marker=2/KNX=11) is wired in any of the pre-loaded managed plans.
 
-        Returns the fub_id of the first plan in which the marker element has a
+        Returns the fub_id of the first plan in which the source element has a
         WebIO connection, else None.
         """
         for fub_id, plan_data in plans.items():
-            if self._marker_wired_in_plan(marker_id, plan_data):
+            if self._marker_wired_in_plan(marker_id, plan_data, ref_type):
                 return fub_id
         return None
 
     @staticmethod
-    def _marker_wired_in_plan(marker_id: int, plan_data: dict) -> bool:
-        """Check if the marker element in this plan has an outgoing connection."""
+    def _marker_wired_in_plan(marker_id: int, plan_data: dict, ref_type: int = 2) -> bool:
+        """Check if the source element (marker=2/KNX=11) in this plan has an outgoing connection."""
         all_matches = [
             elem_id
             for elem_id, elem_data in plan_data.get("elements", {}).items()
-            if (ref := elem_data.get("reference", {})).get("type") == 2 and int(ref.get("ref_id", -1)) == marker_id
+            # reference.type comes back as int or str depending on the response shape — normalize.
+            if str((ref := elem_data.get("reference", {})).get("type")) == str(ref_type)
+            and int(ref.get("ref_id", -1)) == marker_id
         ]
         if len(all_matches) > 1:
             _LOGGER.debug("_marker_wired_in_plan: M%s has MULTIPLE elements in this plan: %s", marker_id, all_matches)
-        marker_elem_id = ComexioAPI._find_marker_element_id(plan_data.get("elements", {}), marker_id)
+        marker_elem_id = ComexioAPI._find_marker_element_id(plan_data.get("elements", {}), marker_id, ref_type)
         if not marker_elem_id:
             _LOGGER.debug("_marker_wired_in_plan: M%s not found as an element in this plan", marker_id)
             return False
@@ -3424,8 +3623,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
     def _audit_wired_pairs(
         self, has_active_plan: bool, managed_io_exts: set[str]
-    ) -> tuple[set[tuple[str, str]] | None, set[tuple[str, str]] | None, set[str] | None, set[str] | None]:
-        """Wired (ref_id, webIoId) pair sets for the audit: (markers, IOs), plus the
+    ) -> tuple[
+        set[tuple[str, str]] | None,
+        set[tuple[str, str]] | None,
+        set[tuple[str, str]] | None,
+        set[str] | None,
+        set[str] | None,
+        set[str] | None,
+    ]:
+        """Wired (ref_id, webIoId) pair sets for the audit: (markers, IOs, KNX objects), plus the
         any-connection-at-all ref_id sets _dangling_source_ids needs alongside them (see there).
 
         Each set is None when its check is disabled (no active plan / no managed IO
@@ -3433,10 +3639,18 @@ class ComexioCoordinator(DataUpdateCoordinator):
         """
         wired_marker_pairs: set[tuple[str, str]] | None = None
         connected_marker_ids: set[str] | None = None
+        wired_knx_pairs: set[tuple[str, str]] | None = None
+        connected_knx_ids: set[str] | None = None
         if has_active_plan:
             wired_marker_pairs = self._wired_source_webio_pairs("2")
             connected_marker_ids = self._connected_source_ids("2")
             if wired_marker_pairs is None:
+                self._lp_missing_recheck_pending = True
+            # KNX cluster plans mirror marker cluster plans structurally, so they share the
+            # same has_active_plan gate rather than a dedicated extension-scoped flag.
+            wired_knx_pairs = self._wired_source_webio_pairs("11")
+            connected_knx_ids = self._connected_source_ids("11")
+            if wired_knx_pairs is None:
                 self._lp_missing_recheck_pending = True
         wired_io_pairs: set[tuple[str, str]] | None = None
         connected_io_ids: set[str] | None = None
@@ -3445,7 +3659,14 @@ class ComexioCoordinator(DataUpdateCoordinator):
             connected_io_ids = self._connected_source_ids("1")
             if wired_io_pairs is None:
                 self._lp_missing_recheck_pending = True
-        return wired_marker_pairs, wired_io_pairs, connected_marker_ids, connected_io_ids
+        return (
+            wired_marker_pairs,
+            wired_io_pairs,
+            wired_knx_pairs,
+            connected_marker_ids,
+            connected_io_ids,
+            connected_knx_ids,
+        )
 
     def _dangling_source_ids(
         self,
@@ -3531,21 +3752,26 @@ class ComexioCoordinator(DataUpdateCoordinator):
         key: str,
         ha_name: str,
         best_match: dict,
-        wired_pairs: tuple[set[tuple[str, str]] | None, set[tuple[str, str]] | None],
+        wired_pairs: tuple[set[tuple[str, str]] | None, set[tuple[str, str]] | None, set[tuple[str, str]] | None],
         io_meta: dict | None,
         managed_io_exts: set[str],
     ) -> dict[str, Any] | None:
         """Missing-wiring item for one audit key, or None when the pair is wired or unchecked.
 
-        wired_pairs = (marker pairs, IO pairs); a set of None means that check is disabled
-        or not yet loadable this run. Marker keys ("M<id>") are checked against the marker
-        set; IO keys only when their extension is opted into IO cluster management.
+        wired_pairs = (marker pairs, IO pairs, KNX pairs); a set of None means that check is
+        disabled or not yet loadable this run. Marker keys ("M<id>") are checked against the
+        marker set, KNX keys ("K<id>") against the KNX set; IO keys only when their extension
+        is opted into IO cluster management.
         """
-        wired_marker_pairs, wired_io_pairs = wired_pairs
+        wired_marker_pairs, wired_io_pairs, wired_knx_pairs = wired_pairs
         web_id = str(best_match.get("webIoId"))
         if key.startswith("M"):
             if wired_marker_pairs is not None and (key[1:], web_id) not in wired_marker_pairs:
                 return {"name": ha_name, "marker_id": int(key[1:])}
+            return None
+        if key.startswith("K"):
+            if wired_knx_pairs is not None and (key[1:], web_id) not in wired_knx_pairs:
+                return {"name": ha_name, "knx_id": int(key[1:])}
             return None
         if io_meta is None or io_meta["ext_name"] not in managed_io_exts or wired_io_pairs is None:
             return None
@@ -3553,16 +3779,32 @@ class ComexioCoordinator(DataUpdateCoordinator):
             return {"name": ha_name, "ext_name": io_meta["ext_name"], "identifier": io_meta["identifier"]}
         return None
 
+    def _range_cluster_plan_name_for_item(self, item: dict, prefix: str, cluster_size: int) -> str | None:
+        """Cluster-plan name for a missing-wiring item ({marker_id|knx_id: ...}), or None for an IO item."""
+        for cat in (c for c in SOURCE_CATEGORIES.values() if c.range_clustered):
+            if (id_key := f"{cat.key.value}_id") in item:
+                return self._cluster_plan_name(item[id_key], prefix, cluster_size, cat.label)
+        return None
+
+    def _range_cluster_plan_name_for_key(self, key: str, prefix: str, cluster_size: int) -> str | None:
+        """Cluster-plan name for an audit-map key ("M<id>"/"K<id>"), or None for an IO key."""
+        for cat in (c for c in SOURCE_CATEGORIES.values() if c.range_clustered):
+            if key.startswith(cat.audit_key_prefix):
+                return self._cluster_plan_name(int(key[len(cat.audit_key_prefix) :]), prefix, cluster_size, cat.label)
+        return None
+
     def _function_plan_missing_detail(
         self, missing_items: list[dict], ha_map: dict, io_meta_by_key: dict
     ) -> dict[str, Any]:
-        """Split missing-wiring items into per-cluster marker gaps and per-extension IO gaps.
+        """Split missing-wiring items into per-cluster marker/KNX gaps and per-extension IO gaps.
 
         The repair dialog uses this to word whole-cluster gaps (cluster plan never created,
         or deleted directly in Comexio — nothing placed/wired yet) differently from
         individual missing connections. Mirrors ios_by_ext (ext_name -> [gap, total]) with
-        markers_by_plan (marker cluster plan name -> [gap, total]), bucketed the same way
-        the cluster plans themselves are named (_cluster_plan_name).
+        markers_by_plan (cluster plan name -> [gap, total]), bucketed the same way the cluster
+        plans themselves are named (_cluster_plan_name). Marker and KNX cluster plans share this
+        one dict — their plan-name strings never collide ("... - Marker [...]" vs "... - KNX
+        [...]"), so no separate knx_by_plan bucket is needed.
         """
         prefix = self.config_entry.options.get(CONF_FUNCTION_PLAN_PLAN_PREFIX, DEFAULT_FUNCTION_PLAN_PLAN_PREFIX)
         cluster_size = int(
@@ -3572,15 +3814,13 @@ class ComexioCoordinator(DataUpdateCoordinator):
         )
         gaps_by_plan: dict[str, int] = {}
         for item in missing_items:
-            if "marker_id" in item:
-                plan_name = self._cluster_plan_name(item["marker_id"], prefix, cluster_size)
+            if (plan_name := self._range_cluster_plan_name_for_item(item, prefix, cluster_size)) is not None:
                 gaps_by_plan[plan_name] = gaps_by_plan.get(plan_name, 0) + 1
         totals_by_plan = dict.fromkeys(gaps_by_plan, 0)
         for key in ha_map:
-            if key.startswith("M"):
-                plan_name = self._cluster_plan_name(int(key[1:]), prefix, cluster_size)
-                if plan_name in totals_by_plan:
-                    totals_by_plan[plan_name] += 1
+            plan_name = self._range_cluster_plan_name_for_key(key, prefix, cluster_size)
+            if plan_name in totals_by_plan:
+                totals_by_plan[plan_name] += 1
 
         gaps_by_ext: dict[str, int] = {}
         for item in missing_items:
@@ -3595,30 +3835,89 @@ class ComexioCoordinator(DataUpdateCoordinator):
             "ios_by_ext": {ext: [gaps_by_ext[ext], totals_by_ext[ext]] for ext in sorted(gaps_by_ext)},
         }
 
-    def _audit_trigger_pairs(self, trigger_marker_ids: list[int]) -> tuple[list[int], list[int]] | None:
-        """Compare trigger markers ([TRIG]/[TP]) against the dedicated trigger plan's wiring.
+    def _trigger_ids_by_ref(self, data: dict[str, Any]) -> dict[int, list[int]]:
+        """Trigger source ids ([TRIG]/[TP]) grouped by plan-element ref_type, one bucket per
+        active, trigger-capable source category (marker ref_type=2, KNX ref_type=11 — blind guess).
 
-        Returns (missing_ids, orphan_ids): missing = trigger marker without a *complete*
-        Marker+Flanke round trip in the plan (plan may not even exist yet, or pair creation
-        may have failed partway through, leaving a bare marker element); orphan = any Marker
-        element present in the plan — complete pair or not — whose marker is no longer
-        kind==TRIGGER (suffix removed, or the marker was removed while its pair creation was
-        still incomplete). Cleanup finds and removes whatever Flanke wiring exists for an
-        orphaned marker regardless of completeness, so an incomplete leftover pair must be
-        reported here too, not just fully-wired ones — otherwise it never gets swept up. Uses
+        Marker and KNX ids share one numeric space, so the audit has to run per category
+        rather than over a flat merged list — this produces the per-ref_type input for it.
+
+        Deliberately skips a category the user has opted out of (not in active_webio_classes)
+        instead of producing an empty bucket for it: unlike the Web-IO wiring/dangling audit,
+        which reads structure straight from the plan snapshot and stays correct regardless of
+        opt-in, _audit_trigger_pairs' orphan detection depends on this method's *positive*
+        list of still-legitimate trigger sources — every existing plan element not in that
+        list is treated as orphaned and gets deleted by the next full sync. Since data[cat.
+        data_key] is deliberately empty for an opted-out category (see _async_update_data),
+        an unfiltered bucket for it would misread "we didn't look" as "none of these are
+        trigger sources anymore" and delete every real trigger pair the moment the category
+        is toggled off. Skipping the bucket entirely leaves that category's trigger wiring
+        untouched while inactive, consistent with async_check_ignored_sources' same guard.
+        """
+        active = self.active_webio_classes
+        return {
+            int(cat.fub_module_type): [
+                int(item["id"]) for item in data[cat.data_key] if item.get("kind") == MarkerKind.TRIGGER
+            ]
+            for cat in trigger_pair_categories()
+            if cat.key in active
+        }
+
+    def _audit_all_trigger_pairs(
+        self, trigger_ids_by_ref: dict[int, list[int]]
+    ) -> tuple[dict[int, list[int]], dict[int, list[int]]] | None:
+        """Run _audit_trigger_pairs once per source category, collecting the non-empty
+        missing/orphan id lists keyed by ref_type.
+
+        Returns None as soon as one per-category audit signals "trigger plan exists but is
+        not in the bulk snapshot yet" — the caller then defers the whole trigger check to
+        the next cycle instead of acting on a partial picture.
+        """
+        missing_by_ref: dict[int, list[int]] = {}
+        orphan_by_ref: dict[int, list[int]] = {}
+        for ref_type, ids in trigger_ids_by_ref.items():
+            result = self._audit_trigger_pairs(ids, ref_type)
+            if result is None:
+                return None
+            missing_ids, orphan_ids = result
+            if missing_ids:
+                missing_by_ref[ref_type] = missing_ids
+            if orphan_ids:
+                orphan_by_ref[ref_type] = orphan_ids
+        return missing_by_ref, orphan_by_ref
+
+    def _audit_trigger_pairs(
+        self, trigger_marker_ids: list[int], ref_type: int = 2
+    ) -> tuple[list[int], list[int]] | None:
+        """Compare trigger sources ([TRIG]/[TP]) of one category (ref_type) against the
+        dedicated trigger plan's wiring.
+
+        Returns (missing_ids, orphan_ids): missing = trigger source without a *complete*
+        Source+Flanke round trip in the plan (plan may not even exist yet, or pair creation
+        may have failed partway through, leaving a bare source element); orphan = any source
+        element of this ref_type present in the plan — complete pair or not — whose source is
+        no longer kind==TRIGGER (suffix removed, or the source was removed while its pair
+        creation was still incomplete). Cleanup finds and removes whatever Flanke wiring exists
+        for an orphaned source regardless of completeness, so an incomplete leftover pair must
+        be reported here too, not just fully-wired ones — otherwise it never gets swept up. Uses
         the cached plan snapshot (self.function_plan_plans), consistent with the other
         Function Plan checks above — not a live reload on every audit tick. The mapped
         fub_id's live $Fubs name is checked (same freshness guard as
         _resolve_single_cluster_plan) so a renamed/repurposed/reused plan id is treated as
         "no trigger plan yet" instead of being audited as if it still were the trigger plan —
         otherwise a coincidentally-complete pair in that unrelated plan would make a trigger
-        marker look wired when resolve_trigger_plan() would actually create a fresh plan.
+        source look wired when resolve_trigger_plan() would actually create a fresh plan.
 
-        Returns None instead while the trigger plan's fub_id is a confirmed existing plan
-        that simply has not landed in the bulk snapshot yet (same partial-snapshot startup/
-        reload window _relevant_plans_loaded guards against for the generic Web-IO wiring
-        check) — otherwise an unloaded-but-real plan would read as "zero wired pairs" and
-        misreport every trigger marker as missing until the next poll.
+        Called once per source category (marker ref_type=2, KNX ref_type=11 — blind guess for
+        KNX, unverified against real KNX plan data) — marker and KNX ids share the same numeric
+        space, so a single merged call could not tell them apart. Mirrors the per-category
+        _dangling_source_ids pattern above.
+
+        Returns None while the trigger plan's fub_id is a confirmed existing plan that simply
+        has not landed in the bulk snapshot yet (same partial-snapshot startup/reload window
+        _relevant_plans_loaded guards against for the generic Web-IO wiring check) — otherwise
+        an unloaded-but-real plan would read as "zero wired pairs" and misreport every trigger
+        source as missing until the next poll.
         """
         raw_map = self.config_entry.options.get(CONF_FUNCTION_PLAN_PLAN_MAP, {})
         plan_map = {k: int(v) for k, v in raw_map.items()} if isinstance(raw_map, dict) else {}
@@ -3630,15 +3929,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
 
         plan_data = self.function_plan_plans[fub_id]
         existing_by_ref, _ = self.api._function_plan_existing_refs(plan_data)
-        all_marker_ids = {ref_id for ref_type, ref_id in existing_by_ref if ref_type == 2}
-        wired_marker_ids = self.api._function_plan_trigger_wired_marker_ids(plan_data)
+        all_marker_ids = {ref_id for rt, ref_id in existing_by_ref if rt == ref_type}
+        wired_marker_ids = self.api._function_plan_trigger_wired_marker_ids(plan_data, ref_type)
 
         missing_ids = [mid for mid in trigger_marker_ids if mid not in wired_marker_ids]
         trigger_id_set = set(trigger_marker_ids)
         orphan_ids = [mid for mid in all_marker_ids if mid not in trigger_id_set]
         return missing_ids, orphan_ids
 
-    async def async_fresh_trigger_audit(self) -> tuple[list[int], list[int]]:
+    async def async_fresh_trigger_audit(self) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
         """Fetch Comexio's config directly and re-run the trigger-pair audit against it.
 
         async_request_refresh() is *not* an option here: _async_update_data() returns the
@@ -3651,16 +3950,16 @@ class ComexioCoordinator(DataUpdateCoordinator):
         cold-start fallback that only concerns unnamed markers.
 
         get_raw_config() returns {} on an HTTP failure rather than raising — indistinguishable
-        from a genuinely empty config by shape alone. Proceeding anyway would derive an empty
-        trigger_marker_ids list and make _audit_trigger_pairs() read every existing Marker
-        element in the trigger plan as orphaned, deleting valid self-reset pairs over what was
-        really just a transient fetch failure. So an empty result skips the audit entirely
-        (missing=[], orphan=[] — a safe no-op); the next successful poll or sync retries it.
+        from a genuinely empty config by shape alone. Proceeding anyway would derive empty
+        trigger id lists and make _audit_trigger_pairs() read every existing source element
+        in the trigger plan as orphaned, deleting valid self-reset pairs over what was really
+        just a transient fetch failure. So an empty result skips the audit entirely
+        ({}, {} — a safe no-op); the next successful poll or sync retries it.
 
-        _audit_trigger_pairs() can itself return None (trigger plan exists but its data hasn't
-        landed in the bulk snapshot yet) — treated the same safe-no-op way here, since this
-        caller (button.py, mid-sync) has no non-blocking way to force that snapshot to refresh
-        and must not misread "not loaded yet" as "plan is empty, everything's orphaned."
+        _audit_all_trigger_pairs() can itself return None (trigger plan exists but its data
+        hasn't landed in the bulk snapshot yet) — treated the same safe-no-op way here, since
+        this caller (button.py, mid-sync) has no non-blocking way to force that snapshot to
+        refresh and must not misread "not loaded yet" as "plan is empty, everything's orphaned."
         """
         raw_config = await self.api.get_raw_config()
         if not raw_config:
@@ -3669,17 +3968,23 @@ class ComexioCoordinator(DataUpdateCoordinator):
                 "misreading it as zero trigger markers and deleting valid self-reset pairs",
                 self.server_id,
             )
-            return [], []
+            return {}, {}
+        # parse_config() itself doesn't know about import_* opt-in flags and returns every
+        # category unfiltered — but that's fine here: _trigger_ids_by_ref() now does its own
+        # active_webio_classes gating (an earlier version of this method instead blanked an
+        # opted-out category's list to [] before handing it to _trigger_ids_by_ref, which
+        # backfired — see that method's docstring for why an empty-but-present bucket reads
+        # as "every existing trigger pair just got orphaned" rather than "category inactive,
+        # don't touch its wiring").
         parsed = self.api.parse_config(raw_config)
-        trigger_marker_ids = [int(m["id"]) for m in parsed["markers"] if m.get("kind") == MarkerKind.TRIGGER]
-        trigger_audit_result = self._audit_trigger_pairs(trigger_marker_ids)
+        trigger_audit_result = self._audit_all_trigger_pairs(self._trigger_ids_by_ref(parsed))
         if trigger_audit_result is None:
             _LOGGER.warning(
                 "[%s] Trigger re-audit: trigger plan not yet in the bulk snapshot — skipping "
                 "this sync's trigger-pair check, will retry on the next poll",
                 self.server_id,
             )
-            return [], []
+            return {}, {}
         return trigger_audit_result
 
     def _function_plan_missing_eta_sec(self, missing_items: list[dict]) -> int:
@@ -3706,6 +4011,8 @@ class ComexioCoordinator(DataUpdateCoordinator):
         for item in missing_items:
             if "marker_id" in item:
                 plan_name = self._cluster_plan_name(item["marker_id"], prefix, cluster_size)
+            elif "knx_id" in item:
+                plan_name = self._cluster_plan_name(item["knx_id"], prefix, cluster_size, "KNX")
             else:
                 plan_name = self._io_cluster_plan_name_for_ext(item["ext_name"], prefix)
             new_pairs_per_plan[plan_name] = new_pairs_per_plan.get(plan_name, 0) + 1

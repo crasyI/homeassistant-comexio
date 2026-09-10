@@ -1,6 +1,8 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 import re
+from typing import Any
 
 from homeassistant.util import slugify
 
@@ -14,8 +16,10 @@ CONF_SERVER_ID = "server_id"
 
 CONF_SCHEMA_MARKER = "schema_marker"
 CONF_SCHEMA_IO = "schema_io"
+CONF_SCHEMA_KNX = "schema_knx"
 DEFAULT_SCHEMA_MARKER = "M{MarkerId} {MarkerTitle}"
 DEFAULT_SCHEMA_IO = "{ExtName} {IoId} {IoTitle}"
+DEFAULT_SCHEMA_KNX = "K{KnxId} {KnxTitle}"
 
 # keys for API access
 CONF_API_USERNAME = "api_username"
@@ -31,6 +35,7 @@ CONF_ENTITY_ID_MIGRATION_IGNORED = "entity_id_migration_ignored"
 CONF_STATISTICS_CLEANUP_IGNORED = "statistics_cleanup_ignored"
 CONF_INCLUDE_OFFLINE_EXTENSIONS = "include_offline_extensions"
 CONF_IGNORED_MARKERS = "ignored_markers"
+CONF_IGNORED_KNX = "ignored_knx"
 
 # The option-key VALUES below keep the legacy "logikplan" spelling — they are persisted
 # in entry.options (and mirrored as field keys in translations/*.json); renaming them
@@ -51,14 +56,14 @@ DEFAULT_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN = 100
 CONF_FUNCTION_PLAN_IO_EXTENSIONS = "logikplan_io_extensions"
 
 
-# Web-IO class split: HA maintains two separate Web-IO device classes on the Comexio
-# server — one for Markers, one for physical IOs — derived from the single webio_name
-# field in the config/options flow by appending a suffix. The webIoId (the per-command
-# key inside $FubModules["10"]) is a global counter across ALL Web-IO devices on a
-# Comexio server, never reused per-device (verified live 2026-07-27), so commands from
-# both classes can share one flat webio_commands lookup without ambiguity.
+# Web-IO class split: HA maintains separate Web-IO device classes on the Comexio
+# server — one per source category (Marker, physical IO, KNX object) — derived from the
+# single webio_name field in the config/options flow by appending a suffix. The webIoId
+# (the per-command key inside $FubModules["10"]) is a global counter across ALL Web-IO
+# devices on a Comexio server, never reused per-device (verified live 2026-07-27), so
+# commands from every class can share one flat webio_commands lookup without ambiguity.
 class WebioClass(StrEnum):
-    """The two Web-IO device classes HA manages on the Comexio server.
+    """The Web-IO device classes HA manages on the Comexio server.
 
     A StrEnum so every existing string-based usage (dict keys, equality checks,
     f-string interpolation, JSON payloads sent to/scraped back from Comexio)
@@ -67,48 +72,223 @@ class WebioClass(StrEnum):
 
     MARKER = "marker"
     IO = "io"
+    KNX = "knx"
 
 
 WEBIO_CLASS_MARKER = WebioClass.MARKER
 WEBIO_CLASS_IO = WebioClass.IO
+WEBIO_CLASS_KNX = WebioClass.KNX
 WEBIO_CLASSES = tuple(WebioClass)
-_WEBIO_CLASS_SUFFIXES = {WebioClass.MARKER: " [M]", WebioClass.IO: " [IO]"}
-_WEBIO_CLASS_LABELS = {WebioClass.MARKER: "Marker", WebioClass.IO: "IO"}
+
+# Internal audit-map key convention (coordinator._async_update_data): IO entries are keyed
+# as "IO_{ext_name}_{identifier}", markers as bare "M{id}", KNX objects as bare "K{id}" —
+# centralized here so the build and classify sides can't drift apart.
+_IO_AUDIT_KEY_PREFIX = "IO_"
+_MARKER_AUDIT_KEY_PREFIX = "M"
+_KNX_AUDIT_KEY_PREFIX = "K"
+
+
+@dataclass(frozen=True, kw_only=True)
+class SourceCategory:
+    """Table-driven description of one Comexio source type HA mirrors as entities.
+
+    Markers and KNX objects are near-identical twins: server-side state variables
+    with numeric ids, mirrored 1:1 and clustered into "HA - <label> [n-m]" id-range
+    function plans. Physical IOs are the odd one out (ext/identifier composite keys,
+    one cluster plan per extension, binary_sensor support) and keep some special
+    handling at the call sites where genericity isn't reachable. Adding a further
+    Comexio module type = one more entry in SOURCE_CATEGORIES.
+    """
+
+    key: WebioClass
+    fub_module_type: str  # $FubModules key holding the raw source items
+    data_key: str  # parse_config() output-dict key ("markers"/"io"/"knx")
+    audit_key_prefix: str  # coordinator audit-map key prefix
+    webio_name_suffix: str  # appended to the configured webio_name (" [M]"/" [IO]"/" [KNX]")
+    label: str  # short display label for sync/audit messages (English — used in UI/log text)
+    german_label: str  # German equivalent, used only in options_flow.py's German-only inline
+    # validation errors ("Merker" is the correct German automation term, distinct from the
+    # English/code "Marker" — see [[feedback_persistent_notification_language]] for why
+    # everything else stays English)
+    schema_conf_key: str  # entry.options key for the entity-name schema
+    schema_default: str  # default entity-name schema
+    id_placeholder: str  # entity-name schema format key for the id
+    title_placeholder: str  # entity-name schema format key for the title
+    unique_id_infix: str  # HA unique_id infix ("m"/""/"k")
+    range_clustered: bool  # True → id-range cluster plans; False → one plan per extension
+    supports_trigger_pairs: bool  # True → [TRIG]/[TP] items get a shared-trigger-plan self-reset pair
+    import_conf_key: str  # entry.options opt-in flag
+    import_default: bool  # default for the opt-in flag (KNX ships OFF)
+    ignored_conf_key: str | None = None  # entry.options key for the ignore-list (None → not supported)
+
+
+# KNX objects live under $FubModules["11"] ("knxIo" per $FubTypes). They are implemented
+# blind (no real KNX hardware / sample JSON) — see project_knx_objects memory. Every
+# blind-guessed code point elsewhere (set_value params, webhook routing, trigger ref_type)
+# carries an inline marker.
+SOURCE_CATEGORIES: dict[WebioClass, SourceCategory] = {
+    WebioClass.MARKER: SourceCategory(
+        key=WebioClass.MARKER,
+        fub_module_type="2",
+        data_key="markers",
+        audit_key_prefix=_MARKER_AUDIT_KEY_PREFIX,
+        webio_name_suffix=" [M]",
+        label="Marker",
+        german_label="Merker",
+        schema_conf_key=CONF_SCHEMA_MARKER,
+        schema_default=DEFAULT_SCHEMA_MARKER,
+        id_placeholder="MarkerId",
+        title_placeholder="MarkerTitle",
+        unique_id_infix="m",
+        range_clustered=True,
+        supports_trigger_pairs=True,
+        import_conf_key="import_markers",
+        import_default=True,
+        ignored_conf_key=CONF_IGNORED_MARKERS,
+    ),
+    WebioClass.IO: SourceCategory(
+        key=WebioClass.IO,
+        fub_module_type="1",
+        data_key="io",
+        audit_key_prefix=_IO_AUDIT_KEY_PREFIX,
+        webio_name_suffix=" [IO]",
+        label="IO",
+        german_label="IO",
+        schema_conf_key=CONF_SCHEMA_IO,
+        schema_default=DEFAULT_SCHEMA_IO,
+        id_placeholder="IoId",
+        title_placeholder="IoTitle",
+        unique_id_infix="",
+        range_clustered=False,
+        supports_trigger_pairs=False,
+        import_conf_key="import_ios",
+        import_default=True,
+        ignored_conf_key=None,
+    ),
+    WebioClass.KNX: SourceCategory(
+        key=WebioClass.KNX,
+        fub_module_type="11",
+        data_key="knx",
+        audit_key_prefix=_KNX_AUDIT_KEY_PREFIX,
+        webio_name_suffix=" [KNX]",
+        label="KNX",
+        german_label="KNX-Objekt",
+        schema_conf_key=CONF_SCHEMA_KNX,
+        schema_default=DEFAULT_SCHEMA_KNX,
+        id_placeholder="KnxId",
+        title_placeholder="KnxTitle",
+        unique_id_infix="k",
+        range_clustered=True,
+        supports_trigger_pairs=True,
+        import_conf_key="import_knx",
+        import_default=False,
+        ignored_conf_key=CONF_IGNORED_KNX,
+    ),
+}
+
+
+def source_category(webio_class: str) -> SourceCategory:
+    """Registry entry for a Web-IO class; raises ValueError on an unknown class."""
+    try:
+        return SOURCE_CATEGORIES[WebioClass(webio_class)]
+    except (ValueError, KeyError) as err:
+        raise ValueError(f"Unknown Web-IO class {webio_class!r}, expected one of {WEBIO_CLASSES}") from err
+
+
+def active_webio_classes(conf: Mapping[str, Any]) -> tuple[WebioClass, ...]:
+    """Web-IO classes currently opted into via each category's import_conf_key flag.
+
+    A category the user has opted out of (e.g. KNX, opt-in and OFF by default) is never
+    expected to have a Web-IO device/class on the Comexio server — audit and full-sync
+    logic must use this instead of the unconditional WEBIO_CLASSES, or an opted-out
+    category's absence gets flagged as "missing" (spurious repair issue, wipes
+    last_audit_results every poll) and a full sync force-creates it anyway. WEBIO_CLASSES
+    itself stays the right choice for uninstall/cleanup, which must still catch a class
+    left behind from before the user opted out.
+    """
+    return tuple(
+        cls
+        for cls in WEBIO_CLASSES
+        if conf.get(SOURCE_CATEGORIES[cls].import_conf_key, SOURCE_CATEGORIES[cls].import_default)
+    )
+
+
+def classify_audit_key(key: str) -> WebioClass:
+    """Map an internal audit-map key back to its Web-IO class by longest-matching prefix."""
+    best, best_len = WebioClass.MARKER, -1
+    for cat in SOURCE_CATEGORIES.values():
+        if key.startswith(cat.audit_key_prefix) and len(cat.audit_key_prefix) > best_len:
+            best, best_len = cat.key, len(cat.audit_key_prefix)
+    return best
+
+
+def category_by_fub_module_type(fub_module_type: int | str) -> SourceCategory:
+    """Registry entry matching a $FubModules key / plan-element ref_type (2/11/...).
+
+    The reverse of source_category(): trigger-pair and function-plan-link call sites
+    only carry a bare ref_type int (see FUB_BASE_REF_ID_FLANKE / ref_type params in
+    coordinator.py), not a WebioClass — this lets them derive the source's audit
+    prefix/label registry-style instead of hard-coding a second "2"->"M" mapping.
+    Raises ValueError for any fub_module_type not present in SOURCE_CATEGORIES.
+    """
+    fub_module_type = str(fub_module_type)
+    for cat in SOURCE_CATEGORIES.values():
+        if cat.fub_module_type == fub_module_type:
+            return cat
+    raise ValueError(f"No SourceCategory for fub_module_type {fub_module_type!r}")
+
+
+def trigger_pair_categories() -> list[SourceCategory]:
+    """Source categories whose [TRIG]/[TP] items get a shared-trigger-plan self-reset pair.
+
+    Currently Marker + KNX (IO has no server-side state to self-reset). Callers iterate
+    this instead of hard-coding the (2, 11) ref_type pair so a further trigger-capable
+    module type is picked up by flipping one registry flag.
+    """
+    return [cat for cat in SOURCE_CATEGORIES.values() if cat.supports_trigger_pairs]
+
+
+def ignore_list_categories() -> list[SourceCategory]:
+    """Source categories that support an ignore-list (schema + import + ignored-ids options).
+
+    Currently Marker + KNX — the same two categories trigger_pair_categories() returns today,
+    but for an unrelated reason (ignored_conf_key vs. supports_trigger_pairs), so options_flow's
+    per-category options schema loop uses this rather than trigger_pair_categories() as a
+    stand-in. A future category could support one flag without the other.
+    """
+    return [cat for cat in SOURCE_CATEGORIES.values() if cat.ignored_conf_key is not None]
 
 
 def webio_class_name(webio_name: str, webio_class: str) -> str:
-    """Comexio Web-IO class name for one of the two HA-managed classes (marker/io)."""
-    if webio_class not in _WEBIO_CLASS_SUFFIXES:
-        raise ValueError(f"Unknown Web-IO class {webio_class!r}, expected one of {WEBIO_CLASSES}")
-    return f"{webio_name}{_WEBIO_CLASS_SUFFIXES[webio_class]}"
+    """Comexio Web-IO class name for one of the HA-managed classes (marker/io/knx)."""
+    return f"{webio_name}{source_category(webio_class).webio_name_suffix}"
 
 
 def webio_class_label(webio_class: str) -> str:
-    """Short display label ('Marker'/'IO') for a Web-IO class, used in sync/audit messages."""
-    if webio_class not in _WEBIO_CLASS_LABELS:
-        raise ValueError(f"Unknown Web-IO class {webio_class!r}, expected one of {WEBIO_CLASSES}")
-    return _WEBIO_CLASS_LABELS[webio_class]
-
-
-# Internal audit-map key convention (coordinator._async_update_data): IO entries are keyed
-# as "IO_{ext_name}_{identifier}", markers as bare "M{id}" — centralized here so the build
-# and classify sides can't drift apart.
-_IO_AUDIT_KEY_PREFIX = "IO_"
+    """Short display label ('Marker'/'IO'/'KNX') for a Web-IO class, used in sync/audit messages."""
+    return source_category(webio_class).label
 
 
 def io_audit_key(ext_name: str, identifier: str) -> str:
-    """Build the internal audit-map key identifying an IO (as opposed to a Marker)."""
+    """Build the internal audit-map key identifying an IO (composite ext_name+identifier key —
+    IO's own special case; range_clustered categories use source_audit_key() instead)."""
     return f"{_IO_AUDIT_KEY_PREFIX}{ext_name}_{identifier}"
 
 
-def is_io_audit_key(key: str) -> bool:
-    """Whether an internal audit-map key identifies an IO (vs. a Marker)."""
-    return key.startswith(_IO_AUDIT_KEY_PREFIX)
+def source_audit_key(category: SourceCategory, item_id: object) -> str:
+    """Build the internal audit-map key identifying a range_clustered source item (Marker/KNX).
+
+    Registry-driven counterpart to io_audit_key(): every range_clustered category keys its
+    audit-map entries by a plain "<prefix><id>" string (e.g. "M5"/"K5"), so one function
+    covers all of them via category.audit_key_prefix — classify_audit_key() is the reverse
+    lookup (audit key -> WebioClass) for callers that need to go the other way.
+    """
+    return f"{category.audit_key_prefix}{item_id}"
 
 
-# Sync-progress percentage span shared by all Web-IO classes, subdivided evenly per class
-# in button.py's `_class_pct_ranges` so the UI progress bar advances smoothly regardless
-# of how many classes exist (currently 2, but not hard-coded to that number).
+# Sync-progress percentage span shared by all active Web-IO classes, subdivided evenly per
+# class in button.py's `_class_pct_ranges` so the UI progress bar advances smoothly regardless
+# of how many classes are active (not hard-coded to a specific count).
 SYNC_PROGRESS_START_PCT = 5
 SYNC_PROGRESS_END_PCT = 95
 
@@ -504,28 +684,31 @@ KNOWN_DOMAINS = [
 ]
 
 
-def parse_ignored_marker_tokens(raw: str) -> Iterator[tuple[str, int | tuple[int, int] | None]]:
-    """Split and parse an ignored_markers string into (token, parsed) pairs.
+def parse_ignored_marker_tokens(
+    raw: str, prefix_chars: str = "Mm"
+) -> Iterator[tuple[str, int | tuple[int, int] | None]]:
+    """Split and parse an ignored-ids string into (token, parsed) pairs.
 
-    Handles comma/semicolon/space/dot separators, optional M/m prefix, and ranges like '8-12'.
-    Empty tokens are skipped. `parsed` is an int for a single marker ID, a (start, end)
+    Handles comma/semicolon/space/dot separators, an optional leading letter prefix
+    (`prefix_chars` — "Mm" for markers, "Kk" for KNX objects), and ranges like '8-12'.
+    Empty tokens are skipped. `parsed` is an int for a single ID, a (start, end)
     tuple for an inclusive range, or None if the token could not be parsed.
 
     Shared low-level parser: `expand_ignored_marker_ids` below uses it for lenient runtime
-    expansion, `options_flow._normalize_ignored_markers` uses it for strict UI validation.
+    expansion, `options_flow._normalize_ignored_ids` uses it for strict UI validation.
     """
     for token in raw.replace(";", ",").replace(" ", ",").replace(".", ",").split(","):
         display_token = token.strip()
         if not display_token:
             continue
-        parse_token = display_token.lstrip("Mm")
+        parse_token = display_token.lstrip(prefix_chars)
         if not parse_token:
             yield display_token, None
             continue
         if "-" in parse_token:
             parts = parse_token.split("-", 1)
             try:
-                start, end = int(parts[0]), int(parts[1].lstrip("Mm"))
+                start, end = int(parts[0]), int(parts[1].lstrip(prefix_chars))
             except ValueError:
                 yield display_token, None
                 continue
@@ -537,13 +720,13 @@ def parse_ignored_marker_tokens(raw: str) -> Iterator[tuple[str, int | tuple[int
                 yield display_token, None
 
 
-def expand_ignored_marker_ids(raw: str) -> set[int]:
-    """Expand an ignored_markers config string to a set of integer marker IDs.
+def expand_ignored_marker_ids(raw: str, prefix_chars: str = "Mm") -> set[int]:
+    """Expand an ignored-ids config string (markers or KNX) to a set of integer IDs.
 
     Invalid tokens are silently ignored (runtime use; options_flow validates separately).
     """
     result: set[int] = set()
-    for _token, parsed in parse_ignored_marker_tokens(raw):
+    for _token, parsed in parse_ignored_marker_tokens(raw, prefix_chars):
         if parsed is None:
             continue
         if isinstance(parsed, tuple):

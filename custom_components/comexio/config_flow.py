@@ -151,6 +151,8 @@ class ComexioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional(CONF_API_PASSWORD, default=ui.get(CONF_API_PASSWORD, "")): str,
                 vol.Required("import_markers", default=ui.get("import_markers", True)): bool,
                 vol.Required("import_ios", default=ui.get("import_ios", True)): bool,
+                # Opt-in, default OFF — blind implementation, see project_knx_objects memory.
+                vol.Required("import_knx", default=ui.get("import_knx", False)): bool,
                 vol.Required("webio_name", default=ui.get("webio_name", "HomeAssistant")): str,
                 vol.Required(
                     "scan_interval",

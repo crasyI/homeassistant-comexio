@@ -13,7 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_INCLUDE_OFFLINE_EXTENSIONS, DOMAIN, MarkerKind, bus_load_signal
 from .coordinator import ComexioCoordinator
-from .entity import ComexioIOEntity, ComexioMarkerEntity
+from .entity import ComexioIOEntity, ComexioKnxEntity, ComexioMarkerEntity
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -39,6 +39,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if marker["type"] == "digital"
             and marker.get("kind") == MarkerKind.READ_ONLY
             and int(marker["id"]) not in ignored_ids
+        )
+
+    # Read-only ("[RO]") digital KNX objects (blind, see project_knx_objects memory) — opt-in, default OFF
+    if conf.get("import_knx", False):
+        ignored_knx = coordinator.ignored_knx_ids
+        entities.extend(
+            ComexioKnxBinarySensor(coordinator, coordinator.server_id, knx)
+            for knx in coordinator.data.get("knx", [])
+            if knx["type"] == "digital"
+            and knx.get("kind") == MarkerKind.READ_ONLY
+            and int(knx["id"]) not in ignored_knx
         )
 
     entities.append(ComexioSdCardSensor(coordinator, coordinator.server_id))
@@ -80,9 +91,20 @@ class ComexioMarkerBinarySensor(ComexioMarkerEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return true if the digital marker is active."""
-        val = self.coordinator.marker_states.get(self._marker_id, 0)
-        return float(val) >= 1.0
+        """Return true if the digital source is active."""
+        return float(self._source_value or 0) >= 1.0
+
+
+class ComexioKnxBinarySensor(ComexioKnxEntity, ComexioMarkerBinarySensor):
+    """A read-only ("[RO]") digital Comexio KNX object (blind implementation, see project_knx_objects memory)."""
+
+    @property
+    def is_on(self) -> bool | None:
+        """None until the first webhook. Unlike markers, KNX objects have no authoritative
+        poll path, so a pre-webhook value would be a fabricated 'off' rather than a known state.
+        """
+        val = self._source_value
+        return None if val is None else float(val or 0) >= 1.0
 
 
 class ComexioSdCardSensor(BinarySensorEntity):

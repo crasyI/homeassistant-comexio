@@ -20,6 +20,7 @@ from .const import (
     CONF_SERVER_ID,
     CONF_USERNAME,
     DOMAIN,
+    SOURCE_CATEGORIES,
     MarkerKind,
     webio_range_check_entity_id,
 )
@@ -151,13 +152,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 _LOGGER.error("Received non-JSON payload on webhook %s", webhook_id)
                 return
             val = data.get("value")
-            if data.get("type") == "io":
+            webhook_type = data.get("type")
+            if webhook_type == "io":
                 ext = data.get("ext")
                 io_id = data.get("io")
                 if not ext or not io_id:
                     _LOGGER.warning("Webhook IO event missing ext/io: %s", data)
                     return
                 coordinator.update_io_by_name(ext, io_id, val)
+            elif webhook_type == "knx":
+                # Blind guess: KNX webhook payload shape assumed identical to markers
+                # (no real KNX hardware/sample payload available — see project_knx_objects memory).
+                knx_id = data.get("id")
+                if knx_id is None:
+                    _LOGGER.warning("Webhook KNX event missing id: %s", data)
+                    return
+                coordinator.update_knx(knx_id, val)
             else:
                 marker_id = data.get("id")
                 if marker_id is None:
@@ -178,10 +188,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     # ---------------------------
     ent_reg = er.async_get(hass)
 
-    # Get all IDs of objects currently recognized by the coordinator
+    # Get all IDs of objects currently recognized by the coordinator. Markers and KNX objects
+    # (registry-driven via SOURCE_CATEGORIES.range_clustered) share the "M{id}"/"K{id}" unique_id
+    # shape; IO uses its own ext_name+identifier shape and is handled separately below.
     active_unique_ids = set()
-    for m in coordinator.data.get("markers", []):
-        active_unique_ids.add(f"comexio_{server_id}_m{m['id']}".lower())
+    for category in (cat for cat in SOURCE_CATEGORIES.values() if cat.range_clustered):
+        for src in coordinator.data.get(category.data_key, []):
+            active_unique_ids.add(f"comexio_{server_id}_{category.unique_id_infix}{src['id']}".lower())
 
     include_offline = conf.get(CONF_INCLUDE_OFFLINE_EXTENSIONS, False)
     for io in coordinator.data.get("io", []):
@@ -228,16 +241,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     # Build expected-platform map so that entities which migrated to a different
     # HA domain (e.g. sensor → binary_sensor after firmware upgrade) get removed.
+    # Markers and KNX objects share the same kind/type → platform rules.
     expected_platform: dict[str, str] = {}
-    for m in coordinator.data.get("markers", []):
-        uid = f"comexio_{server_id}_m{m['id']}".lower()
-        kind = m.get("kind")
-        if kind == MarkerKind.READ_ONLY:
-            expected_platform[uid] = "binary_sensor" if m["type"] == "digital" else "sensor"
-        elif kind == MarkerKind.TRIGGER:
-            expected_platform[uid] = "button"
-        else:
-            expected_platform[uid] = "switch" if m["type"] == "digital" else "number"
+    for category in (cat for cat in SOURCE_CATEGORIES.values() if cat.range_clustered):
+        for src in coordinator.data.get(category.data_key, []):
+            uid = f"comexio_{server_id}_{category.unique_id_infix}{src['id']}".lower()
+            kind = src.get("kind")
+            if kind == MarkerKind.READ_ONLY:
+                expected_platform[uid] = "binary_sensor" if src["type"] == "digital" else "sensor"
+            elif kind == MarkerKind.TRIGGER:
+                expected_platform[uid] = "button"
+            else:
+                expected_platform[uid] = "switch" if src["type"] == "digital" else "number"
     for io in coordinator.data.get("io", []):
         if not io.get("offline") or include_offline:
             uid = f"comexio_{server_id}_{io['ext_name']}_{io['identifier']}".lower()

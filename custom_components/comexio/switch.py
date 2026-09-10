@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_INCLUDE_OFFLINE_EXTENSIONS, DOMAIN, MarkerKind
 from .coordinator import ComexioCoordinator
-from .entity import ComexioIOEntity, ComexioMarkerEntity
+from .entity import ComexioIOEntity, ComexioKnxEntity, ComexioMarkerEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,6 +30,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if marker["type"] == "digital"
             and int(marker["id"]) not in ignored_ids
             and marker.get("kind") == MarkerKind.NORMAL
+        )
+
+    # 1b. Digital KNX objects (blind implementation, see project_knx_objects memory) — opt-in, default OFF
+    if conf.get("import_knx", False):
+        ignored_knx = coordinator.ignored_knx_ids
+        entities.extend(
+            ComexioKnxSwitch(coordinator, coordinator.server_id, knx)
+            for knx in coordinator.data.get("knx", [])
+            if knx["type"] == "digital" and int(knx["id"]) not in ignored_knx and knx.get("kind") == MarkerKind.NORMAL
         )
 
     # 2. Digital Outputs (Relays) — binary and writable (not an input)
@@ -54,25 +63,36 @@ class ComexioMarkerSwitch(ComexioMarkerEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return true if the digital marker is active."""
-        val = self.coordinator.marker_states.get(self._marker_id, 0)
-        return float(val) >= 1.0
+        """Return true if the digital source is active."""
+        return float(self._source_value or 0) >= 1.0
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the marker on."""
-        if not await self.coordinator.api.set_value("marker", self._marker_id, 1):
-            raise HomeAssistantError(f"Failed to turn on marker {self._marker_id}")
+        """Turn the source on."""
+        if not await self._async_source_write(1):
+            raise HomeAssistantError(f"Failed to turn on {self._source_label} {self._marker_id}")
 
-        self.coordinator.update_marker(self._marker_id, 1)
+        self._source_cache_update(1)
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the marker off."""
-        if not await self.coordinator.api.set_value("marker", self._marker_id, 0):
-            raise HomeAssistantError(f"Failed to turn off marker {self._marker_id}")
+        """Turn the source off."""
+        if not await self._async_source_write(0):
+            raise HomeAssistantError(f"Failed to turn off {self._source_label} {self._marker_id}")
 
-        self.coordinator.update_marker(self._marker_id, 0)
+        self._source_cache_update(0)
         self.async_write_ha_state()
+
+
+class ComexioKnxSwitch(ComexioKnxEntity, ComexioMarkerSwitch):
+    """A digital Comexio KNX object as a Switch (blind implementation, see project_knx_objects memory)."""
+
+    @property
+    def is_on(self) -> bool | None:
+        """None until the first webhook. Unlike markers, KNX objects have no authoritative
+        poll path, so a pre-webhook value would be a fabricated 'off' rather than a known state.
+        """
+        val = self._source_value
+        return None if val is None else float(val or 0) >= 1.0
 
 
 class ComexioIOSwitch(ComexioIOEntity, SwitchEntity):

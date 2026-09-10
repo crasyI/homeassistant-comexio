@@ -19,6 +19,7 @@
           "api_password": "API Password (Basic Auth)",
           "import_markers": "Create entities for markers",
           "import_ios": "Create entities for IOs",
+          "import_knx": "Create entities for KNX objects",
           "scan_interval": "Background polling interval (min)",
           "cover_keywords": "Keywords for cover detection"
         }
@@ -92,6 +93,7 @@
         "title": "Comexio Settings",
         "data": {
           "schema_marker": "Naming Schema for Markers",
+          "schema_knx": "Naming Schema for KNX objects",
           "schema_io": "Naming Schema for IOs",
           "scan_interval": "Background polling interval (min)",
           "enable_notifications": "Show UI pop-up notifications during sync",
@@ -101,6 +103,7 @@
           "logikplan_max_pairs_per_plan": "Max. pairs per managed function plan",
           "logikplan_io_extensions": "Extensions managed as IO cluster plans",
           "ignored_markers": "Marker IDs to exclude from function plan connection",
+          "ignored_knx": "KNX object IDs to exclude from function plan connection",
           "cover_keywords": "Keywords for cover detection",
           "function_plan_backup_retention_months": "Orphaned backup retention",
           "bus_watchdog_enabled": "Enable Bus-Load Watchdog",
@@ -108,11 +111,13 @@
         },
         "data_description": {
           "schema_marker": "Available variables: '{{MarkerId}}', '{{MarkerTitle}}'",
+          "schema_knx": "Available variables: '{{KnxId}}', '{{KnxTitle}}'",
           "schema_io": "Available variables: '{{ExtName}}', '{{IoId}}', '{{IoTitle}}'",
           "logikplan_plan_prefix": "Prefix for auto-created cluster plans. Plans are named like: HA - Marker [1-100].",
           "logikplan_max_pairs_per_plan": "How many Web-IO + marker pairs fit into one managed plan before a new cluster plan is created. For IO cluster plans this maps to 1 (50), 2 (100) or 3 (150) extensions per plan.",
           "logikplan_io_extensions": "Each selected extension gets its IOs wired into a managed IO cluster plan (e.g. HA - IO [Ext]), one column per extension. Start with a single extension to test, then add the others.",
           "ignored_markers": "Comma-, semicolon-, space- or dot-separated marker IDs and ranges, with or without 'M' prefix (e.g. '123, 456; 789' or 'M123, M456' or '8-12'). Only markers with a description can be ignored.",
+          "ignored_knx": "Comma-, semicolon-, space- or dot-separated KNX object IDs and ranges, with or without 'K' prefix (e.g. '123, 456; 789' or 'K123, K456' or '8-12'). Only KNX objects with a description can be ignored.",
           "cover_keywords": "Comma-separated list (e.g. blind, shutter, roller)",
           "function_plan_backup_retention_months": "Backup snapshots of a plan that was deleted directly in Comexio are purged automatically once they are older than this. A live plan's backups are never affected. Also available as the 'Function Plan Purge Orphaned Backups' action for an on-demand cleanup.",
           "bus_watchdog_enabled": "On a sustained bus-load rise, automatically restart the HA-managed cluster function plans (back to front) to try to relieve it. Non-destructive to the Comexio system itself.",
