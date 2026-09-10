@@ -25,6 +25,12 @@ from multidict import MultiDict
 # Mandatory DOMAIN import for Audit logic
 from .const import (
     COMEXIO_HTTP_TIMEOUT_SEC,
+    CONF_SCHEMA_IO,
+    CONF_SCHEMA_KNX,
+    CONF_SCHEMA_MARKER,
+    DEFAULT_SCHEMA_IO,
+    DEFAULT_SCHEMA_KNX,
+    DEFAULT_SCHEMA_MARKER,
     FLANKE_PORT_IN,
     FLANKE_PORT_OUT_RISING,
     FUB_BASE_REF_ID_FLANKE,
@@ -43,12 +49,14 @@ from .const import (
     MARKER_READ_ONLY_SUFFIX,
     MARKER_TRIGGER_SUFFIXES,
     WEBIO_CLASS_IO,
+    WEBIO_CLASS_KNX,
     WEBIO_CLASS_MARKER,
     WEBIO_CLASSES,
     WEBIO_INT16_DANGER_ZONE,
     WEBIO_MARKER_ANALOG_MAX,
     WEBIO_MARKER_ANALOG_MIN,
     MarkerKind,
+    category_by_fub_module_type,
     io_column_rows,
     io_sort_key,
     webio_class_label,
@@ -620,9 +628,10 @@ class ComexioAPI:
             "markers": [],
             "io": [],
             "io_all": [],
+            "knx": [],
             "webio_commands": {},
             "webio_names": {},
-            # Two separate Web-IO device classes on the Comexio server — see const.webio_class_name.
+            # One Web-IO device class per source category on the Comexio server — see const.webio_class_name.
             "webio_devices": {cls: {"device_id": None, "device_ip": None, "base_id": None} for cls in WEBIO_CLASSES},
             # Per-extension identity (name + stable serial), see _process_ios — used by the
             # coordinator's extension-rename migration to detect a Comexio-side rename.
@@ -636,7 +645,7 @@ class ComexioAPI:
 
         # Load configuration
         config_names = self._load_config_names()
-        webio_name, schema_marker, schema_io, server_alias = config_names
+        webio_name, schema_marker, schema_io, schema_knx, server_alias = config_names
 
         # Extract FubModules once
         fub_modules = conf.get("FubModules", {})
@@ -650,30 +659,40 @@ class ComexioAPI:
         # 4. Process IOs
         self._process_ios(data, schema_io, server_alias, fub_modules)
 
+        # 5. Process KNX objects (opt-in via import_knx; coordinator drops the list when disabled).
+        # No "wired but unnamed" import for KNX: marker and KNX ids share a numeric space, so the
+        # marker reference set cannot be reused here without cross-contamination. A KNX object is
+        # imported only when it carries a real Comexio label. See _process_knx for why it doesn't
+        # receive live_states either.
+        self._process_knx(data, schema_knx, server_alias, fub_modules)
+
         _LOGGER.info(
-            "Audit: %d Markers, %d IOs, %d Webhooks in Comexio for %s",
+            "Audit: %d Markers, %d IOs, %d KNX, %d Webhooks in Comexio for %s",
             len(data["markers"]),
             len(data["io"]),
+            len(data["knx"]),
             len(data["webio_commands"]),
             webio_name,
         )
         return data
 
-    def _load_config_names(self) -> tuple[str, str, str, str]:
+    def _load_config_names(self) -> tuple[str, str, str, str, str]:
         """Load configuration names from config_entry."""
         webio_name = "HomeAssistant"
-        schema_marker = "M{MarkerId} {MarkerTitle}"
-        schema_io = "{ExtName} {IoId} {IoTitle}"
+        schema_marker = DEFAULT_SCHEMA_MARKER
+        schema_io = DEFAULT_SCHEMA_IO
+        schema_knx = DEFAULT_SCHEMA_KNX
         server_alias = "comexio"
 
         if self.config_entry:
             conf_data = {**self.config_entry.data, **self.config_entry.options}
             webio_name = conf_data.get("webio_name", webio_name)
-            schema_marker = conf_data.get("schema_marker", schema_marker)
-            schema_io = conf_data.get("schema_io", schema_io)
+            schema_marker = conf_data.get(CONF_SCHEMA_MARKER, schema_marker)
+            schema_io = conf_data.get(CONF_SCHEMA_IO, schema_io)
+            schema_knx = conf_data.get(CONF_SCHEMA_KNX, schema_knx)
             server_alias = conf_data.get("server_id", server_alias)
 
-        return webio_name, schema_marker, schema_io, server_alias
+        return webio_name, schema_marker, schema_io, schema_knx, server_alias
 
     # Reference canvas bounds: A4 landscape at 90 DPI (empirically measured on live Comexio)
     _CANVAS_REF_X: float = 870.0
@@ -869,7 +888,7 @@ class ComexioAPI:
         fub_modules: dict[str, Any],
         referenced_marker_ids: set[str] | None = None,
     ) -> None:
-        """Process markers from config.
+        """Process markers from config ($FubModules["2"]).
 
         A marker without a Comexio label is normally excluded entirely — but one that is
         actually wired into a function plan (referenced_marker_ids) is imported anyway with
@@ -878,36 +897,110 @@ class ComexioAPI:
         Comexio, or drops out of every plan, it naturally reverts to the normal path (named
         marker, or orphaned like any other unused marker) — no special-case cleanup needed.
         """
-        referenced_marker_ids = referenced_marker_ids or set()
-        for m in fub_modules.get("2", {}).values():
-            if m.get("Id") is None:
+        data["markers"].extend(
+            self._process_source_items(
+                fub_modules,
+                module_key="2",
+                schema=schema_marker,
+                id_prefix="M",
+                id_placeholder="MarkerId",
+                title_placeholder="MarkerTitle",
+                server_alias=server_alias,
+                live_states=live_states,
+                referenced_ids=referenced_marker_ids,
+            )
+        )
+
+    def _process_knx(
+        self,
+        data: dict[str, Any],
+        schema_knx: str,
+        server_alias: str,
+        fub_modules: dict[str, Any],
+    ) -> None:
+        """Process KNX objects from config ($FubModules["11"], "knxIo" per $FubTypes).
+
+        Structurally modeled 1:1 on markers (see _process_markers) — same title-suffix kind
+        heuristic ([RO]/[TRIG]/[TP]), same analog/digital Type mapping. Built blind against
+        the marker schema pending real KNX hardware.
+
+        No live_states here on purpose: get_live_states() only ever queries marker values
+        ("MarkerName": f"M{i}"), keyed by the same plain numeric id KNX objects use — passing
+        it through would silently hand e.g. KNX object 5 marker 5's live value. KNX objects
+        start at value 0 and pick up their real value from the next webhook push instead
+        (BLIND GUESS: no known bulk live-value endpoint for KNX objects).
+        """
+        data["knx"].extend(
+            self._process_source_items(
+                fub_modules,
+                module_key="11",
+                schema=schema_knx,
+                id_prefix="K",
+                id_placeholder="KnxId",
+                title_placeholder="KnxTitle",
+                server_alias=server_alias,
+                live_states={},
+            )
+        )
+
+    def _process_source_items(
+        self,
+        fub_modules: dict[str, Any],
+        *,
+        module_key: str,
+        schema: str,
+        id_prefix: str,
+        id_placeholder: str,
+        title_placeholder: str,
+        server_alias: str,
+        live_states: dict[str, Any],
+        referenced_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Shared Marker/KNX item processing over one $FubModules category.
+
+        Both categories carry the same relevant fields (Id, Name, Type) and are exposed to
+        HA identically, so the per-item build is a single code path parametrized by the
+        id prefix and the entity-name schema placeholder keys.
+        """
+        referenced_ids = referenced_ids or set()
+        items: list[dict[str, Any]] = []
+        group = fub_modules.get(module_key)
+        # Comexio serializes gap-free id groups as JSON arrays instead of objects (same
+        # quirk as $FubModules["10"], see _build_webio_name_lexicon) — group members are
+        # values either way, so the array case just iterates it directly.
+        group_items = group.values() if isinstance(group, dict) else (group or [])
+        for raw in group_items:
+            if not isinstance(raw, dict) or raw.get("Id") is None:
                 continue
 
-            m_id = str(m.get("Id"))
-            has_name = bool(m.get("Name"))
-            if not has_name and m_id not in referenced_marker_ids:
+            item_id = str(raw.get("Id"))
+            has_name = bool(raw.get("Name"))
+            if not has_name and item_id not in referenced_ids:
                 continue
 
-            m_type_raw = m.get("Type", 1)
-            m_type_str = "analog" if m_type_raw in [2, 3] else "digital"
-            m_title = m.get("Name") or self._NO_NAME_MARKER_TITLE
+            type_raw = raw.get("Type", 1)
+            type_str = "analog" if type_raw in [2, 3] else "digital"
+            title = raw.get("Name") or self._NO_NAME_MARKER_TITLE
 
-            ha_name = schema_marker.format_map(SafeDict(ServerAlias=server_alias, MarkerId=m_id, MarkerTitle=m_title))
+            ha_name = schema.format_map(
+                SafeDict(ServerAlias=server_alias, **{id_placeholder: item_id, title_placeholder: title})
+            )
 
-            data["markers"].append(
+            items.append(
                 {
-                    "id": m_id,
+                    "id": item_id,
                     "ha_name": " ".join(ha_name.split()),
-                    "name": f"M{m_id} {m_title}",
-                    # Unnamed-but-referenced marker ("#nn"): the plan preview greys it out
+                    "name": f"{id_prefix}{item_id} {title}",
+                    # Unnamed-but-referenced item ("#nn"): the plan preview greys it out
                     # like an inactive IO as a visual hint that it has no label in Comexio.
                     "no_name": not has_name,
-                    "type": m_type_str,
-                    "type_raw": m_type_raw,
-                    "value": self._clean_value(live_states.get(m_id, 0)),
-                    "kind": self._marker_kind(m_title),
+                    "type": type_str,
+                    "type_raw": type_raw,
+                    "value": self._clean_value(live_states.get(item_id, 0)),
+                    "kind": self._marker_kind(title),
                 }
             )
+        return items
 
     @staticmethod
     def _marker_kind(m_title: str) -> MarkerKind:
@@ -1322,30 +1415,38 @@ class ComexioAPI:
         parsed_data: dict[str, Any],
         webio_class: str | None = None,
         ignored_marker_ids: set[int] | None = None,
+        ignored_knx_ids: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the list of Web-IO command dicts for the given parsed configuration.
 
-        webio_class restricts the result to one Web-IO class ("marker"/"io"), for the bulk
-        class-upload path (generate_webio_json); None returns both (delta-sync payload lookup,
-        where the destination device is chosen separately per command).
-        ignored_marker_ids excludes markers the user configured as ignored — they have no HA
-        entity, so they need no Web-IO command pushing values back via webhook.
+        webio_class restricts the result to one Web-IO class ("marker"/"io"/"knx"), for the
+        bulk class-upload path (generate_webio_json); None returns all (delta-sync payload
+        lookup, where the destination device is chosen separately per command).
+        ignored_marker_ids / ignored_knx_ids exclude items the user configured as ignored —
+        they have no HA entity, so they need no Web-IO command pushing values back via webhook.
         Returns the list directly so callers can use it without a json.dumps/json.loads roundtrip.
         """
         webhook_path = f"/api/webhook/comexio_{server_id}"
         commands: list[dict[str, Any]] = []
 
         # 1. Create Web-IO for markers
-        markers = parsed_data.get("markers", []) if webio_class != WEBIO_CLASS_IO else []
+        markers = parsed_data.get("markers", []) if webio_class in (None, WEBIO_CLASS_MARKER) else []
         for m in markers:
             if ignored_marker_ids and int(m["id"]) in ignored_marker_ids:
                 continue
             commands.append(self._build_marker_webio_command(m, webhook_path))
 
         # 2. Create Web-IO for IOs
-        io_entries = parsed_data.get("io", []) if webio_class != WEBIO_CLASS_MARKER else []
+        io_entries = parsed_data.get("io", []) if webio_class in (None, WEBIO_CLASS_IO) else []
         for io_item in io_entries:
             commands.append(self._build_io_webio_command(io_item, webhook_path))
+
+        # 3. Create Web-IO for KNX objects
+        knx_entries = parsed_data.get("knx", []) if webio_class in (None, WEBIO_CLASS_KNX) else []
+        for knx_item in knx_entries:
+            if ignored_knx_ids and int(knx_item["id"]) in ignored_knx_ids:
+                continue
+            commands.append(self._build_marker_webio_command(knx_item, webhook_path, source_type=WEBIO_CLASS_KNX))
 
         return commands
 
@@ -1389,11 +1490,18 @@ class ComexioAPI:
         }
 
     @staticmethod
-    def _build_marker_webio_command(m: dict[str, Any], webhook_path: str) -> dict[str, Any]:
-        """Build the Web-IO command dict for a single marker."""
+    def _build_marker_webio_command(
+        m: dict[str, Any], webhook_path: str, source_type: str = WEBIO_CLASS_MARKER
+    ) -> dict[str, Any]:
+        """Build the Web-IO command dict for a single marker or KNX object.
+
+        source_type is the literal written into the webhook Lua payload's ``type=`` field
+        ("marker" or "knx"); it decides which coordinator update path the pushed value hits.
+        """
         is_ana = m["type"] == "analog"
         safe_id = ComexioAPI._lua_escape(m["id"])
-        lua = ComexioAPI._webio_data_lua(f'id="{safe_id}", value=a, type="marker"')
+        safe_type = ComexioAPI._lua_escape(source_type)
+        lua = ComexioAPI._webio_data_lua(f'id="{safe_id}", value=a, type="{safe_type}"')
         return ComexioAPI._webio_command(
             name=f"HA {m['name']}",
             type_id=2 if is_ana else 1,
@@ -1448,19 +1556,23 @@ class ComexioAPI:
         parsed_data: dict[str, Any],
         webio_class: str | None = None,
         ignored_marker_ids: set[int] | None = None,
+        ignored_knx_ids: set[int] | None = None,
     ) -> str:
         """Generate the upload-ready JSON string for the Comexio Web-IO importer.
 
         webio_name here is already the class-specific name (see const.webio_class_name) —
-        callers append the ' [M]'/' [IO]' suffix before calling this.
-        ignored_marker_ids is forwarded to build_webio_commands() to exclude ignored markers.
+        callers append the ' [M]'/' [IO]'/' [KNX]' suffix before calling this.
+        ignored_marker_ids / ignored_knx_ids are forwarded to build_webio_commands() to
+        exclude ignored items.
         """
         return json.dumps(
             {
                 "data": "web_io",
                 "format": 1,
                 "base": {"Identifier": webio_name, "UseCookies": 0, "Login": 2, "BaseId": 0},
-                "commands": self.build_webio_commands(server_id, parsed_data, webio_class, ignored_marker_ids),
+                "commands": self.build_webio_commands(
+                    server_id, parsed_data, webio_class, ignored_marker_ids, ignored_knx_ids
+                ),
             }
         )
 
@@ -2263,13 +2375,13 @@ class ComexioAPI:
         return str(ref.get("type")) == "5" and str(ref.get("ref_id")) == flanke_ref_id
 
     @staticmethod
-    def _function_plan_trigger_wired_marker_ids(plan_data: dict | None) -> set[int]:
-        """Marker (type=2) ref_ids in plan_data with a complete Marker<->Flanke round trip.
+    def _function_plan_trigger_wired_marker_ids(plan_data: dict | None, ref_type: int = 2) -> set[int]:
+        """Source (marker=2/KNX=11) ref_ids in plan_data with a complete <->Flanke round trip.
 
-        A marker element that exists but is missing either the Marker->Flanke or the
-        Flanke->Marker connection — e.g. left behind by a pair creation that failed
+        A source element that exists but is missing either the ->Flanke or the
+        Flanke-> connection — e.g. left behind by a pair creation that failed
         partway through — must not count as wired: the trigger audit needs to see it
-        as still incomplete so sync repairs it, instead of treating a bare marker
+        as still incomplete so sync repairs it, instead of treating a bare source
         element as proof the self-reset wiring is already in place.
         """
         if not plan_data:
@@ -2296,7 +2408,7 @@ class ComexioAPI:
         return {
             int(ComexioAPI._function_plan_elem_ref(elements, elem_id)["ref_id"])
             for elem_id in wired_marker_elem_ids
-            if str(ComexioAPI._function_plan_elem_ref(elements, elem_id).get("type")) == "2"
+            if str(ComexioAPI._function_plan_elem_ref(elements, elem_id).get("type")) == str(ref_type)
         }
 
     async def _function_plan_wire_ref_pair(
@@ -2395,8 +2507,9 @@ class ComexioAPI:
         marker_ids: list[int],
         fresh_plan: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
+        ref_type: int = 2,
     ) -> tuple[list[int], list[str]]:
-        """Add Marker (type=2) + Web-IO (type=10) element pairs to a stopped plan.
+        """Add Marker/KNX (type=2/11) + Web-IO (type=10) element pairs to a stopped plan.
 
         Reloads Comexio config to pick up freshly created Web-IO commands (webIoId),
         retrying with backoff (see _reload_config_until_commands_ready) since a
@@ -2405,16 +2518,19 @@ class ComexioAPI:
         (sorted by marker ID) — no sort pass is needed afterwards. Otherwise the
         elements get placeholder positions and a sort run must follow.
         progress_cb(done, total) is invoked after every processed marker.
+        ref_type selects the source category (marker=2 / KNX=11 — blind guess),
+        driving the source data key and the plan-element type.
         Returns (added_marker_ids, error_messages).
         """
+        category = category_by_fub_module_type(ref_type)
 
         def _expected_names(data: dict) -> set[str]:
-            markers = {int(m["id"]): m for m in data.get("markers", [])}
+            markers = {int(m["id"]): m for m in data.get(category.data_key, [])}
             return {f"HA {markers[mid]['name']}" for mid in marker_ids if mid in markers}
 
         fresh_data = await self._reload_config_until_commands_ready(_expected_names)
         webio_commands = fresh_data.get("webio_commands", {})
-        markers_by_id = {int(m["id"]): m for m in fresh_data.get("markers", [])}
+        markers_by_id = {int(m["id"]): m for m in fresh_data.get(category.data_key, [])}
 
         plan_data = await self.function_plan_load_elements(fub_id)
         existing_by_ref, conn_endpoints = self._function_plan_existing_refs(plan_data)
@@ -2452,6 +2568,7 @@ class ComexioAPI:
                 existing_by_ref,
                 conn_endpoints,
                 _pair_pos(len(added), i),
+                ref_type,
             )
             if err is None:
                 added.append(marker_id)
@@ -2471,28 +2588,30 @@ class ComexioAPI:
         existing_by_ref: dict[tuple[int, int], int],
         conn_endpoints: list[set[int]],
         pos: tuple[float, float, float],
+        ref_type: int = 2,
     ) -> str | None:
-        """Add one Marker+Web-IO pair at pos=(x_marker, x_webio, y).
+        """Add one Marker/KNX+Web-IO pair at pos=(x_marker, x_webio, y).
 
         Return semantics as _function_plan_wire_ref_pair (None = added, "" = already wired).
         """
+        label = f"{category_by_fub_module_type(ref_type).audit_key_prefix}{marker_id}"
         marker = markers_by_id.get(marker_id)
         if not marker:
-            return f"M{marker_id}: not found in fresh config"
+            return f"{label}: not found in fresh config"
 
         expected_cmd_name = f"HA {marker['name']}"
         webio_cmd = webio_commands.get(expected_cmd_name)
         if not webio_cmd:
-            _LOGGER.warning("function_plan_add_marker_pairs: M%s — Web-IO '%s' not found", marker_id, expected_cmd_name)
-            return f"M{marker_id}: Web-IO '{expected_cmd_name}' not found after config reload"
+            _LOGGER.warning("function_plan_add_marker_pairs: %s — Web-IO '%s' not found", label, expected_cmd_name)
+            return f"{label}: Web-IO '{expected_cmd_name}' not found after config reload"
 
         web_ref_id = webio_cmd.get("webIoId")
         if web_ref_id is None:
-            return f"M{marker_id}: no webIoId for '{expected_cmd_name}'"
+            return f"{label}: no webIoId for '{expected_cmd_name}'"
 
         conn_type = "binary" if marker["type"] == "digital" else "analog"
         return await self._function_plan_wire_ref_pair(
-            fub_id, 2, marker_id, int(web_ref_id), conn_type, f"M{marker_id}", existing_by_ref, conn_endpoints, pos
+            fub_id, ref_type, marker_id, int(web_ref_id), conn_type, label, existing_by_ref, conn_endpoints, pos
         )
 
     async def function_plan_add_trigger_pairs(
@@ -2501,10 +2620,11 @@ class ComexioAPI:
         marker_ids: list[int],
         fresh_plan: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
+        ref_type: int = 2,
     ) -> tuple[list[int], list[str]]:
-        """Add Marker (type=2) + Flanke (type=5) self-reset pairs to the trigger plan.
+        """Add Source (marker=2/KNX=11) + Flanke (type=5) self-reset pairs to the trigger plan.
 
-        No Web-IO element is involved — that wiring stays in the marker's normal cluster
+        No Web-IO element is involved — that wiring stays in the source's normal cluster
         plan, a separate fub_id. See MARKER_TRIGGER_SUFFIXES / FUNCTION_PLAN_TRIGGER_PLAN_NAME
         in const.py for why the two are kept apart.
         fresh_plan=True places the pairs directly at their final grid positions
@@ -2544,7 +2664,7 @@ class ComexioAPI:
         errors: list[str] = []
         for i, marker_id in enumerate(marker_ids):
             err = await self._function_plan_add_single_trigger(
-                fub_id, marker_id, plan_data, existing_by_ref, _pair_pos(len(added), i)
+                fub_id, marker_id, plan_data, existing_by_ref, _pair_pos(len(added), i), ref_type
             )
             if err is None:
                 added.append(marker_id)
@@ -2562,8 +2682,9 @@ class ComexioAPI:
         plan_data: dict | None,
         existing_by_ref: dict[tuple[int, int], int],
         pos: tuple[float, float, float],
+        ref_type: int = 2,
     ) -> str | None:
-        """Add one Marker+Flanke self-reset pair at pos=(x_marker, x_flanke, y).
+        """Add one Source+Flanke self-reset pair at pos=(x_marker, x_flanke, y).
 
         Flanke element is created before the marker element (matches the user's Studio layout
         preference — creation order affects auto-placement even though explicit x/y is passed).
@@ -2582,11 +2703,11 @@ class ComexioAPI:
         (_function_plan_flanke_wires_back) — a one-directional leftover from a failed previous
         attempt must not be reported as already wired.
         """
-        label = f"M{marker_id}"
+        label = f"{category_by_fub_module_type(ref_type).audit_key_prefix}{marker_id}"
         x_marker, x_flanke, y = pos
         flanke_ref_id = int(FUB_BASE_REF_ID_FLANKE)
 
-        existing_marker_elem = existing_by_ref.get((2, marker_id))
+        existing_marker_elem = existing_by_ref.get((ref_type, marker_id))
         existing_flanke_elem: int | None = None
         already_complete = False
         if existing_marker_elem:
@@ -2608,7 +2729,7 @@ class ComexioAPI:
         flanke_is_new = existing_flanke_elem is None
 
         elem_marker = existing_marker_elem or await self.function_plan_add_element(
-            fub_id=fub_id, ref_id=marker_id, element_type=2, x=x_marker, y=y
+            fub_id=fub_id, ref_id=marker_id, element_type=ref_type, x=x_marker, y=y
         )
         if elem_marker is None:
             return await self._function_plan_trigger_add_failed(
@@ -2718,16 +2839,20 @@ class ComexioAPI:
         """True if flanke_elem_id has a Flanke->Marker connection back to marker_elem_id."""
         return ComexioAPI._function_plan_connection_exists(plan_data, flanke_elem_id, marker_elem_id)
 
-    async def function_plan_remove_trigger_pairs(self, fub_id: int, marker_ids: list[int]) -> tuple[int, bool]:
-        """Remove orphaned Marker+Flanke pairs (marker no longer [TRIG]/[TP]) from the trigger plan.
+    async def function_plan_remove_trigger_pairs(
+        self, fub_id: int, marker_ids: list[int], ref_type: int = 2
+    ) -> tuple[int, bool]:
+        """Remove orphaned Source+Flanke pairs (source no longer [TRIG]/[TP]) from the trigger plan.
 
         Returns (deleted element count, plan_stopped) — mirrors _delete_plan_elements_and_restart.
-        Each trigger marker has its own dedicated Flanke element (never shared), so it is
-        always safe to remove alongside its marker.
+        Each trigger source has its own dedicated Flanke element (never shared), so it is
+        always safe to remove alongside its source (marker=2/KNX=11).
         """
         plan_data = await self.function_plan_load_elements(fub_id)
         existing_by_ref, _ = self._function_plan_existing_refs(plan_data)
-        marker_elem_ids = [elem_id for marker_id in marker_ids if (elem_id := existing_by_ref.get((2, marker_id)))]
+        marker_elem_ids = [
+            elem_id for marker_id in marker_ids if (elem_id := existing_by_ref.get((ref_type, marker_id)))
+        ]
         flanke_elem_ids = self._function_plan_paired_flanke_ids(plan_data, marker_elem_ids, int(FUB_BASE_REF_ID_FLANKE))
         elem_ids = marker_elem_ids + flanke_elem_ids
         if not elem_ids:
@@ -2954,11 +3079,11 @@ class ComexioAPI:
         )
 
     @staticmethod
-    def _find_marker_element_id(elements: dict[str, Any], marker_id: int) -> str | None:
-        """Return the plan-local element id of the given marker, or None if not wired into the plan."""
+    def _find_marker_element_id(elements: dict[str, Any], marker_id: int, ref_type: int = 2) -> str | None:
+        """Return the plan-local element id of the given source ref (marker=2/KNX=11), or None if not wired."""
         for elem_id, elem_data in elements.items():
             ref = elem_data.get("reference", {})
-            if ref.get("type") == 2 and int(ref.get("ref_id", -1)) == marker_id:
+            if ref.get("type") == ref_type and int(ref.get("ref_id", -1)) == marker_id:
                 return str(elem_id)
         return None
 
@@ -3110,6 +3235,10 @@ class ComexioAPI:
 
         if target_type == "marker":
             params["marker"] = f"M{target_id}"
+        elif target_type == "knx":
+            # BLIND GUESS pending real KNX hardware: mirrors the marker path with a "K" prefix.
+            # Verify the actual /api/ query-param name against a live Comexio server once available.
+            params["knx"] = f"K{target_id}"
         else:
             if ext is None or identifier is None:
                 _LOGGER.error("Missing 'ext' or 'identifier' for non-marker API write. Type: %s", target_type)

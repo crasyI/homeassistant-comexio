@@ -14,10 +14,8 @@ from .const import (
     CONF_FUNCTION_PLAN_IO_EXTENSIONS,
     CONF_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN,
     CONF_FUNCTION_PLAN_PLAN_PREFIX,
-    CONF_IGNORED_MARKERS,
     CONF_INCLUDE_OFFLINE_EXTENSIONS,
     CONF_SCHEMA_IO,
-    CONF_SCHEMA_MARKER,
     DEFAULT_BUS_WATCHDOG_AUTO_REBOOT,
     DEFAULT_BUS_WATCHDOG_ENABLED,
     DEFAULT_COVER_KEYWORDS,
@@ -26,20 +24,21 @@ from .const import (
     DEFAULT_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN,
     DEFAULT_FUNCTION_PLAN_PLAN_PREFIX,
     DEFAULT_SCHEMA_IO,
-    DEFAULT_SCHEMA_MARKER,
     DOMAIN,
     SCAN_INTERVAL_DEFAULT,
     SCAN_INTERVAL_OPTIONS,
+    ignore_list_categories,
     parse_ignored_marker_tokens,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _normalize_ignored_markers(raw_input: str | None) -> str:
-    """Normalize and validate user input for ignored markers before saving.
+def _normalize_ignored_ids(raw_input: str | None, prefix_chars: str = "Mm", category_label: str = "Merker") -> str:
+    """Normalize and validate user input for ignored marker/KNX IDs before saving.
 
-    Accepts: comma/semicolon/space/dot separators, optional M/m prefix, ranges like '8-12'.
+    Accepts: comma/semicolon/space/dot separators, an optional leading letter prefix
+    (`prefix_chars` — "Mm" for markers, "Kk" for KNX objects), ranges like '8-12'.
     Returns sorted, deduplicated comma-separated string (e.g. '1,3,4,6,20-25'). A single ID
     already covered by a range (e.g. '1-3,2') is dropped rather than kept as a redundant entry.
     Raises vol.Invalid if any token is not a valid integer or range.
@@ -51,7 +50,7 @@ def _normalize_ignored_markers(raw_input: str | None) -> str:
     ranges: set[tuple[int, int]] = set()
     invalid_tokens: list[str] = []
 
-    for token, parsed in parse_ignored_marker_tokens(raw_input):
+    for token, parsed in parse_ignored_marker_tokens(raw_input, prefix_chars):
         if parsed is None:
             invalid_tokens.append(token)
         elif isinstance(parsed, tuple):
@@ -60,9 +59,10 @@ def _normalize_ignored_markers(raw_input: str | None) -> str:
             ints.add(parsed)
 
     if invalid_tokens:
+        example_prefix = prefix_chars[0]
         raise vol.Invalid(
-            f"Ungültige Merker-IDs: {', '.join(repr(t) for t in invalid_tokens[:3])}. "
-            "Zahlen (z.B. '3', 'M12'), Bereiche (z.B. '8-12') oder Listen (z.B. '1, 3, 5') eingeben."
+            f"Ungültige {category_label}-IDs: {', '.join(repr(t) for t in invalid_tokens[:3])}. "
+            f"Zahlen (z.B. '3', '{example_prefix}12'), Bereiche (z.B. '8-12') oder Listen (z.B. '1, 3, 5') eingeben."
         )
 
     ints -= {i for start, end in ranges for i in range(start, end + 1)}
@@ -105,96 +105,122 @@ class ComexioOptionsFlow(config_entries.OptionsFlow):
         ext_names = sorted({io["ext_name"] for io in coordinator_data.get("io", []) if not io.get("offline")})
         ext_names.extend(ext for ext in conf.get(CONF_FUNCTION_PLAN_IO_EXTENSIONS, []) if ext not in ext_names)
 
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(CONF_SCHEMA_MARKER, default=conf.get(CONF_SCHEMA_MARKER, DEFAULT_SCHEMA_MARKER)): str,
-                    vol.Optional(CONF_SCHEMA_IO, default=conf.get(CONF_SCHEMA_IO, DEFAULT_SCHEMA_IO)): str,
-                    vol.Required("import_markers", default=conf.get("import_markers", True)): bool,
-                    vol.Required("import_ios", default=conf.get("import_ios", True)): bool,
-                    vol.Required(
-                        "scan_interval",
-                        default=str(conf.get("scan_interval", SCAN_INTERVAL_DEFAULT)),
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=SCAN_INTERVAL_OPTIONS,
-                            mode=SelectSelectorMode.DROPDOWN,
-                            translation_key="scan_interval",
-                        )
-                    ),
-                    vol.Required(
-                        CONF_ENABLE_NOTIFICATIONS,
-                        default=conf.get(CONF_ENABLE_NOTIFICATIONS, DEFAULT_ENABLE_NOTIFICATIONS),
-                    ): bool,
-                    vol.Required("audit_ignored", default=conf.get("audit_ignored", False)): bool,
-                    vol.Required(
-                        CONF_INCLUDE_OFFLINE_EXTENSIONS,
-                        default=conf.get(CONF_INCLUDE_OFFLINE_EXTENSIONS, False),
-                    ): bool,
-                    vol.Required(
-                        CONF_BUS_WATCHDOG_ENABLED,
-                        default=conf.get(CONF_BUS_WATCHDOG_ENABLED, DEFAULT_BUS_WATCHDOG_ENABLED),
-                    ): bool,
-                    vol.Required(
-                        CONF_BUS_WATCHDOG_AUTO_REBOOT,
-                        default=conf.get(CONF_BUS_WATCHDOG_AUTO_REBOOT, DEFAULT_BUS_WATCHDOG_AUTO_REBOOT),
-                    ): bool,
-                    vol.Optional(
-                        CONF_COVER_KEYWORDS, default=conf.get(CONF_COVER_KEYWORDS, DEFAULT_COVER_KEYWORDS)
-                    ): str,
-                    vol.Optional(CONF_IGNORED_MARKERS, default=conf.get(CONF_IGNORED_MARKERS, "")): str,
-                    vol.Optional(
-                        CONF_FUNCTION_PLAN_PLAN_PREFIX,
-                        default=conf.get(CONF_FUNCTION_PLAN_PLAN_PREFIX, DEFAULT_FUNCTION_PLAN_PLAN_PREFIX),
-                    ): str,
-                    vol.Required(
-                        CONF_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN,
-                        default=str(
-                            conf.get(CONF_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN, DEFAULT_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN)
-                        ),
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=["50", "100", "150"],
-                            mode=SelectSelectorMode.DROPDOWN,
-                            translation_key="function_plan_max_pairs_per_plan",
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_FUNCTION_PLAN_IO_EXTENSIONS,
-                        default=list(conf.get(CONF_FUNCTION_PLAN_IO_EXTENSIONS, [])),
-                    ): SelectSelector(
-                        # No translation_key: the options are live Comexio extension names,
-                        # so there is nothing to translate them against.
-                        SelectSelectorConfig(options=ext_names, multiple=True, mode=SelectSelectorMode.DROPDOWN)
-                    ),
-                    vol.Required(
-                        CONF_FUNCTION_PLAN_BACKUP_RETENTION_MONTHS,
-                        default=str(
-                            conf.get(
-                                CONF_FUNCTION_PLAN_BACKUP_RETENTION_MONTHS,
-                                DEFAULT_FUNCTION_PLAN_BACKUP_RETENTION_MONTHS,
-                            )
-                        ),
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=["1", "3", "6", "12"],
-                            mode=SelectSelectorMode.DROPDOWN,
-                            translation_key="function_plan_backup_retention_months",
-                        )
-                    ),
-                }
-            ),
-            errors=errors,
+        # Marker + KNX share the same schema/import/ignored-ids field shape (registry-driven
+        # via ignore_list_categories — the source categories that support an ignore-list);
+        # IO keeps its own fields since its unique_id/no-ignore-list shape differs.
+        source_cats = ignore_list_categories()
+        schema_dict: dict = {}
+        for cat in source_cats:
+            schema_dict[
+                vol.Optional(cat.schema_conf_key, default=conf.get(cat.schema_conf_key, cat.schema_default))
+            ] = str
+        schema_dict[vol.Optional(CONF_SCHEMA_IO, default=conf.get(CONF_SCHEMA_IO, DEFAULT_SCHEMA_IO))] = str
+        for cat in source_cats:
+            schema_dict[
+                vol.Required(cat.import_conf_key, default=conf.get(cat.import_conf_key, cat.import_default))
+            ] = bool
+        schema_dict[vol.Required("import_ios", default=conf.get("import_ios", True))] = bool
+        schema_dict[
+            vol.Required(
+                "scan_interval",
+                default=str(conf.get("scan_interval", SCAN_INTERVAL_DEFAULT)),
+            )
+        ] = SelectSelector(
+            SelectSelectorConfig(
+                options=SCAN_INTERVAL_OPTIONS,
+                mode=SelectSelectorMode.DROPDOWN,
+                translation_key="scan_interval",
+            )
         )
+        schema_dict[
+            vol.Required(
+                CONF_ENABLE_NOTIFICATIONS,
+                default=conf.get(CONF_ENABLE_NOTIFICATIONS, DEFAULT_ENABLE_NOTIFICATIONS),
+            )
+        ] = bool
+        schema_dict[vol.Required("audit_ignored", default=conf.get("audit_ignored", False))] = bool
+        schema_dict[
+            vol.Required(
+                CONF_INCLUDE_OFFLINE_EXTENSIONS,
+                default=conf.get(CONF_INCLUDE_OFFLINE_EXTENSIONS, False),
+            )
+        ] = bool
+        schema_dict[
+            vol.Required(
+                CONF_BUS_WATCHDOG_ENABLED,
+                default=conf.get(CONF_BUS_WATCHDOG_ENABLED, DEFAULT_BUS_WATCHDOG_ENABLED),
+            )
+        ] = bool
+        schema_dict[
+            vol.Required(
+                CONF_BUS_WATCHDOG_AUTO_REBOOT,
+                default=conf.get(CONF_BUS_WATCHDOG_AUTO_REBOOT, DEFAULT_BUS_WATCHDOG_AUTO_REBOOT),
+            )
+        ] = bool
+        schema_dict[
+            vol.Optional(CONF_COVER_KEYWORDS, default=conf.get(CONF_COVER_KEYWORDS, DEFAULT_COVER_KEYWORDS))
+        ] = str
+        for cat in source_cats:
+            schema_dict[vol.Optional(cat.ignored_conf_key, default=conf.get(cat.ignored_conf_key, ""))] = str
+        schema_dict[
+            vol.Optional(
+                CONF_FUNCTION_PLAN_PLAN_PREFIX,
+                default=conf.get(CONF_FUNCTION_PLAN_PLAN_PREFIX, DEFAULT_FUNCTION_PLAN_PLAN_PREFIX),
+            )
+        ] = str
+        schema_dict[
+            vol.Required(
+                CONF_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN,
+                default=str(conf.get(CONF_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN, DEFAULT_FUNCTION_PLAN_MAX_PAIRS_PER_PLAN)),
+            )
+        ] = SelectSelector(
+            SelectSelectorConfig(
+                options=["50", "100", "150"],
+                mode=SelectSelectorMode.DROPDOWN,
+                translation_key="function_plan_max_pairs_per_plan",
+            )
+        )
+        schema_dict[
+            vol.Optional(
+                CONF_FUNCTION_PLAN_IO_EXTENSIONS,
+                default=list(conf.get(CONF_FUNCTION_PLAN_IO_EXTENSIONS, [])),
+            )
+        ] = SelectSelector(
+            # No translation_key: the options are live Comexio extension names,
+            # so there is nothing to translate them against.
+            SelectSelectorConfig(options=ext_names, multiple=True, mode=SelectSelectorMode.DROPDOWN)
+        )
+        schema_dict[
+            vol.Required(
+                CONF_FUNCTION_PLAN_BACKUP_RETENTION_MONTHS,
+                default=str(
+                    conf.get(
+                        CONF_FUNCTION_PLAN_BACKUP_RETENTION_MONTHS,
+                        DEFAULT_FUNCTION_PLAN_BACKUP_RETENTION_MONTHS,
+                    )
+                ),
+            )
+        ] = SelectSelector(
+            SelectSelectorConfig(
+                options=["1", "3", "6", "12"],
+                mode=SelectSelectorMode.DROPDOWN,
+                translation_key="function_plan_backup_retention_months",
+            )
+        )
+
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema_dict), errors=errors)
 
     @staticmethod
     def _normalize_user_input(user_input: dict, conf: dict, errors: dict) -> None:
         """Validate and normalize user_input in-place; populate errors on failure."""
-        # If field not in user_input, voluptuous didn't receive changes; preserve old value
-        if CONF_IGNORED_MARKERS not in user_input:
-            _LOGGER.warning("ignored_markers field missing from user_input — restoring from saved options")
-            user_input[CONF_IGNORED_MARKERS] = conf.get(CONF_IGNORED_MARKERS, "")
+        source_cats = ignore_list_categories()
+
+        # If a field is missing from user_input, voluptuous didn't receive changes for it —
+        # preserve the old value (registry-driven: Marker + KNX ignore-list fields).
+        for cat in source_cats:
+            if cat.ignored_conf_key not in user_input:
+                _LOGGER.warning("%s field missing from user_input — restoring from saved options", cat.ignored_conf_key)
+                user_input[cat.ignored_conf_key] = conf.get(cat.ignored_conf_key, "")
 
         numeric_option_keys = (
             "scan_interval",
@@ -207,30 +233,33 @@ class ComexioOptionsFlow(config_entries.OptionsFlow):
             try:
                 user_input[key] = int(user_input[key])
             except (ValueError, TypeError) as e:
-                # Kept separate from the ignored_markers try/except below so a numeric-field
-                # error is never misattributed to errors[CONF_IGNORED_MARKERS].
+                # Kept separate from the ignored-ids try/except below so a numeric-field
+                # error is never misattributed to an ignored-ids error key.
                 # Logged at debug only: an expected user-input validation failure, the
                 # translated form error below already tells the user what to fix.
                 _LOGGER.debug("Invalid numeric option %s=%r: %s", key, user_input[key], e)
                 errors["base"] = "invalid_number"
                 return
 
-        try:
-            ignored_raw = user_input.get(CONF_IGNORED_MARKERS, "").strip()
-            user_input[CONF_IGNORED_MARKERS] = _normalize_ignored_markers(ignored_raw)
-        except vol.Invalid as e:
-            errors[CONF_IGNORED_MARKERS] = str(e)
-        except Exception as e:
-            _LOGGER.exception("Unexpected error validating ignored_markers: %s", e)
-            errors[CONF_IGNORED_MARKERS] = f"Fehler bei Validierung: {e}"
+        for cat in source_cats:
+            try:
+                ignored_raw = user_input.get(cat.ignored_conf_key, "").strip()
+                prefix_chars = cat.audit_key_prefix + cat.audit_key_prefix.lower()
+                user_input[cat.ignored_conf_key] = _normalize_ignored_ids(ignored_raw, prefix_chars, cat.german_label)
+            except vol.Invalid as e:
+                errors[cat.ignored_conf_key] = str(e)
+            except Exception as e:
+                _LOGGER.exception("Unexpected error validating %s: %s", cat.ignored_conf_key, e)
+                errors[cat.ignored_conf_key] = f"Fehler bei Validierung: {e}"
 
     def _create_options_entry(self, user_input: dict):
         """Merge new options with existing entry options and create the config entry.
 
         Preserves fields not shown in the form (e.g. passwords); explicitly removes
-        ignored_markers when empty since HA won't auto-delete an emptied optional field.
+        empty ignore-list fields since HA won't auto-delete an emptied optional field.
         """
         merged_options = {**self._config_entry.options, **user_input}
-        if not merged_options.get(CONF_IGNORED_MARKERS, "").strip():
-            merged_options.pop(CONF_IGNORED_MARKERS, None)
+        for cat in ignore_list_categories():
+            if not merged_options.get(cat.ignored_conf_key, "").strip():
+                merged_options.pop(cat.ignored_conf_key, None)
         return self.async_create_entry(title="", data=merged_options)

@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
-from ..const import DOMAIN, WEBIO_CLASSES, MarkerKind, webio_class_name
+from ..const import DOMAIN, MarkerKind, webio_class_name
 from ..coordinator import ComexioCoordinator
 from ..function_plan_render import resolve_element_label
 from ._context import _INSTANCE_NOT_FOUND_LOG, _async_get_service_context
@@ -163,9 +163,14 @@ async def handle_generate_web_io(hass: HomeAssistant, call: ServiceCall) -> None
         conf = {**coordinator.config_entry.data, **coordinator.config_entry.options}
         webio_name = conf.get("webio_name", "HomeAssistant")
 
+        # Only classes the user opted into — an opted-out category (e.g. KNX, default off) has
+        # no HA entities, so uploading its (empty) Web-IO base would just leave an orphan class
+        # on the Comexio server.
+        sync_classes = coordinator.active_webio_classes
+
         if not do_upload:
             preview_parts = []
-            for cls in WEBIO_CLASSES:
+            for cls in sync_classes:
                 class_name = webio_class_name(webio_name, cls)
                 web_io_json = api.generate_webio_json(
                     server_id,
@@ -173,6 +178,7 @@ async def handle_generate_web_io(hass: HomeAssistant, call: ServiceCall) -> None
                     coordinator.data,
                     webio_class=cls,
                     ignored_marker_ids=coordinator.ignored_marker_ids,
+                    ignored_knx_ids=coordinator.ignored_knx_ids,
                 )
                 preview_parts.append(f"**{class_name}**\n```json\n{web_io_json}\n```")
             persistent_notification.async_create(
@@ -181,7 +187,7 @@ async def handle_generate_web_io(hass: HomeAssistant, call: ServiceCall) -> None
             return
 
         results: list[str] = []
-        for cls in WEBIO_CLASSES:
+        for cls in sync_classes:
             class_name = webio_class_name(webio_name, cls)
             web_io_json = api.generate_webio_json(
                 server_id,
@@ -189,6 +195,7 @@ async def handle_generate_web_io(hass: HomeAssistant, call: ServiceCall) -> None
                 coordinator.data,
                 webio_class=cls,
                 ignored_marker_ids=coordinator.ignored_marker_ids,
+                ignored_knx_ids=coordinator.ignored_knx_ids,
             )
 
             base_info = await api.get_webio_base_info(class_name)

@@ -19,7 +19,7 @@ from .const import (
     MarkerKind,
 )
 from .coordinator import ComexioCoordinator
-from .entity import ComexioIOEntity, ComexioMarkerEntity
+from .entity import ComexioIOEntity, ComexioKnxEntity, ComexioMarkerEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +39,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if marker["type"] == "analog"
             and int(marker["id"]) not in ignored_ids
             and marker.get("kind") == MarkerKind.NORMAL
+        )
+
+    # Analog KNX objects (blind implementation, see project_knx_objects memory) — opt-in, default OFF
+    if conf.get("import_knx", False):
+        ignored_knx = coordinator.ignored_knx_ids
+        entities.extend(
+            ComexioKnxNumber(coordinator, coordinator.server_id, knx)
+            for knx in coordinator.data.get("knx", [])
+            if knx["type"] == "analog" and int(knx["id"]) not in ignored_knx and knx.get("kind") == MarkerKind.NORMAL
         )
 
     if conf.get("import_ios", True):
@@ -92,21 +101,25 @@ class ComexioMarkerNumber(ComexioMarkerEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the current value from coordinator cache."""
-        val = self.coordinator.marker_states.get(self._marker_id)
+        val = self._source_value
         if val is None:
             return None
         try:
             return float(val)
         except (ValueError, TypeError):
-            _LOGGER.debug("Could not convert marker value '%s' to float for %s", val, self._marker_id)
+            _LOGGER.debug("Could not convert %s value '%s' to float for %s", self._source_label, val, self._marker_id)
             return None
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the value via API and update local cache."""
-        if not await self.coordinator.api.set_value("marker", self._marker_id, value):
-            raise HomeAssistantError(f"Failed to set value {value} for marker {self._marker_id}")
-        self.coordinator.update_marker(self._marker_id, value)
+        if not await self._async_source_write(value):
+            raise HomeAssistantError(f"Failed to set value {value} for {self._source_label} {self._marker_id}")
+        self._source_cache_update(value)
         self.async_write_ha_state()
+
+
+class ComexioKnxNumber(ComexioKnxEntity, ComexioMarkerNumber):
+    """An analog Comexio KNX object as a Number (blind implementation, see project_knx_objects memory)."""
 
 
 class ComexioIONumber(ComexioIOEntity, NumberEntity):

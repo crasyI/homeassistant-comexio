@@ -51,20 +51,27 @@ from .const import (
     RANGE_CHECK_FAILED,
     RANGE_CHECK_FIXED,
     RANGE_CHECK_SKIPPED,
+    SOURCE_CATEGORIES,
     SYNC_DURATION_DELETE,
     SYNC_DURATION_RECREATE,
     SYNC_DURATION_WRITE,
     SYNC_PROGRESS_END_PCT,
     SYNC_PROGRESS_START_PCT,
+    WEBIO_CLASS_KNX,
     WEBIO_CLASS_MARKER,
     WEBIO_CLASSES,
     MarkerKind,
+    SourceCategory,
+    WebioClass,
+    category_by_fub_module_type,
+    source_category,
+    trigger_pair_categories,
     webio_class_label,
     webio_class_name,
     webio_range_check_entity_id,
 )
 from .coordinator import ComexioCoordinator
-from .entity import ComexioMarkerEntity
+from .entity import ComexioKnxEntity, ComexioMarkerEntity
 from .function_plan_backup import format_backup_label
 from .services import async_resync_io_group_headers, async_sort_function_plan
 
@@ -186,12 +193,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     ]
 
     conf = {**entry.data, **entry.options}
-    if conf.get("import_markers", True):
-        ignored_ids = coordinator.ignored_marker_ids
+    # Trigger ("virtueller Taster") buttons for every trigger-capable source category
+    # (Marker + KNX — registry-driven, see const.trigger_pair_categories).
+    for category in trigger_pair_categories():
+        if not conf.get(category.import_conf_key, category.import_default):
+            continue
+        ignored_ids = coordinator.ignored_ids_for(category.key)
+        button_cls = _TRIGGER_BUTTON_CLASSES[category.key]
         entities.extend(
-            ComexioMarkerTriggerButton(coordinator, coordinator.server_id, marker)
-            for marker in coordinator.data.get("markers", [])
-            if marker.get("kind") == MarkerKind.TRIGGER and int(marker["id"]) not in ignored_ids
+            button_cls(coordinator, coordinator.server_id, src)
+            for src in coordinator.data.get(category.data_key, [])
+            if src.get("kind") == MarkerKind.TRIGGER and int(src["id"]) not in ignored_ids
         )
 
     async_add_entities(entities)
@@ -337,14 +349,14 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             )
 
             gap_items = audit_data.get("function_plan_missing", [])
-            cleanup_entity_ids: list[int] = audit_data.get("cleanup_entities", [])
+            cleanup_entity_ids: list[tuple[str, int]] = audit_data.get("cleanup_entities", [])
             lp_fub_id = self.coordinator.get_active_function_plan_fub_id()
 
             if action == "cleanup_entities":
                 # Standalone action: remove HA entities + Function Plan wiring + WebIO commands
-                # for ignored markers that still have legacy remnants.
+                # for ignored markers/KNX objects that still have legacy remnants.
                 await self._handle_cleanup_entities(
-                    cleanup_entity_ids, api, dev_ids[WEBIO_CLASS_MARKER], notif_id, notify_enabled, lp_fub_id
+                    cleanup_entity_ids, api, dev_ids, notif_id, notify_enabled, lp_fub_id
                 )
                 return
 
@@ -450,18 +462,27 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         debris_removed = 0
         per_class: dict[str, dict[str, int]] = {}
         created_names: list[str] = []
-        # Split the shared progress span evenly across however many classes exist,
-        # so the UI bar advances smoothly regardless of len(WEBIO_CLASSES).
-        pct_span = (SYNC_PROGRESS_END_PCT - SYNC_PROGRESS_START_PCT) / len(WEBIO_CLASSES)
+        # Sync a class if the user opted into it, OR if its Web-IO device still exists on the
+        # server (a class deselected after a prior sync — its orphaned commands must still be
+        # delta-synced away; a full sync would otherwise never touch it). An opted-out class
+        # with no server device is skipped entirely — _decide_effective_action force-"recreate"s
+        # any class with no device, so including it would create it on the live server.
+        opted_in = set(self.coordinator.active_webio_classes)
+        active_classes = tuple(c for c in WEBIO_CLASSES if c in opted_in or dev_ids.get(c))
+        if not active_classes:
+            return 0, 0, 0, 0, False, [], 0, {}, [], 0
+        # Split the shared progress span evenly across however many classes are active,
+        # so the UI bar advances smoothly regardless of len(active_classes).
+        pct_span = (SYNC_PROGRESS_END_PCT - SYNC_PROGRESS_START_PCT) / len(active_classes)
         class_pct_ranges = {
             cls: (
                 round(SYNC_PROGRESS_START_PCT + idx * pct_span),
                 round(SYNC_PROGRESS_START_PCT + (idx + 1) * pct_span),
             )
-            for idx, cls in enumerate(WEBIO_CLASSES)
+            for idx, cls in enumerate(active_classes)
         }
 
-        for cls in WEBIO_CLASSES:
+        for cls in active_classes:
             pct_start, pct_end = class_pct_ranges[cls]
             cls_result = await self._sync_class(
                 ctx,
@@ -521,14 +542,14 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
 
     async def _handle_cleanup_entities(
         self,
-        marker_ids: list[int],
+        entity_ids: list[tuple[str, int] | int],
         api: Any,
-        dev_id: str | None,
+        dev_ids: dict[str, str | None],
         notif_id: str,
         notify_enabled: bool,
         lp_fub_id: int | None = None,
     ) -> None:
-        """Remove HA entities, Function Plan elements and WebIO commands for ignored markers."""
+        """Remove HA entities, Function Plan elements and WebIO commands for ignored markers/KNX objects."""
 
         def _notify(msg: str) -> None:
             if notify_enabled:
@@ -536,67 +557,107 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
                     self.hass, msg, title=f"Comexio Cleanup ({self.server_id})", notification_id=notif_id
                 )
 
-        if not marker_ids:
+        if not entity_ids:
             # Reachable via a direct press_action service call with no pending audit gap — the
-            # repair-flow UI only ever offers this action when marker_ids is non-empty. Give
+            # repair-flow UI only ever offers this action when entity_ids is non-empty. Give
             # explicit feedback instead of silently no-op-ing, consistent with the sibling
             # function_plan_add_missing action's "Nothing to do." fallback.
-            _notify("Nothing to clean up — no ignored markers currently have leftover entities to remove.")
-            _LOGGER.info("[%s] cleanup_entities: nothing to clean up (no marker_ids)", self.server_id)
+            _notify(
+                "Nothing to clean up — no ignored markers or KNX objects currently have leftover entities to remove."
+            )
+            _LOGGER.info("[%s] cleanup_entities: nothing to clean up (no entity_ids)", self.server_id)
             return
 
-        # marker_ids comes from a possibly-stale audit snapshot; a marker could have been
-        # un-ignored in the meantime (between the audit poll and this button press). Restrict
-        # the destructive operations below to markers that are still actually ignored.
-        marker_ids = [mid for mid in marker_ids if mid in self.coordinator.ignored_marker_ids]
-        if not marker_ids:
-            _notify("Nothing to clean up — the markers flagged by the last audit are no longer ignored.")
-            _LOGGER.info("[%s] cleanup_entities: no marker_ids still ignored, skipping", self.server_id)
+        # Legacy audit snapshots (pre-KNX) stored bare marker ids; tolerate that shape too.
+        grouped: dict[WebioClass, list[int]] = {}
+        for entry in entity_ids:
+            cls, eid = (WEBIO_CLASS_MARKER, entry) if isinstance(entry, int) else entry
+            grouped.setdefault(WebioClass(cls), []).append(eid)
+
+        # entity_ids come from a possibly-stale audit snapshot; a marker/KNX object could have
+        # been un-ignored in the meantime (between the audit poll and this button press).
+        # Restrict the destructive operations below to ids that are still actually ignored.
+        all_lines: list[str] = []
+        for cls, ids in grouped.items():
+            category = source_category(cls)
+            ignored_ids = self.coordinator.ignored_ids_for(cls)
+            still_ignored = [eid for eid in ids if eid in ignored_ids]
+            if not still_ignored:
+                continue
+            all_lines.extend(
+                await self._cleanup_entities_for_category(category, still_ignored, api, dev_ids.get(cls), lp_fub_id)
+            )
+
+        if not all_lines:
+            _notify("Nothing to clean up — the markers/KNX objects flagged by the last audit are no longer ignored.")
+            _LOGGER.info("[%s] cleanup_entities: no entity_ids still ignored, skipping", self.server_id)
             return
 
-        deleted_entities = self._delete_marker_entities(marker_ids)
+        _notify("\n".join(all_lines))
+        _LOGGER.info("[%s] cleanup_entities done: %s", self.server_id, ", ".join(all_lines))
+
+    async def _cleanup_entities_for_category(
+        self, category: SourceCategory, ids: list[int], api: Any, dev_id: str | None, lp_fub_id: int | None
+    ) -> list[str]:
+        """Run the entity/Function-Plan/WebIO cleanup for one source category; return summary lines."""
+        deleted_entities = self._delete_marker_entities(ids, category)
         lp_count, webio_cmd_ids, stopped_plans, stop_failures = await self._cleanup_function_plan_plans(
-            api, marker_ids, lp_fub_id
+            api, ids, lp_fub_id, category
         )
-        webio_removed, webio_failed = await self._delete_webio_commands(api, dev_id, webio_cmd_ids)
+        webio_removed, webio_failed = await self._delete_webio_commands(api, dev_id, webio_cmd_ids, category)
 
         lines = self._build_cleanup_summary_lines(
-            marker_ids, deleted_entities, lp_count, webio_removed, webio_failed, has_stop_failures=bool(stop_failures)
+            ids,
+            deleted_entities,
+            lp_count,
+            webio_removed,
+            webio_failed,
+            category,
+            has_stop_failures=bool(stop_failures),
         )
         lines.extend(self._notify_stopped_plans(stopped_plans))
         lines.extend(self._build_stop_failure_lines(stop_failures))
-        _notify("\n".join(lines))
-        _LOGGER.info("[%s] cleanup_entities done: %s", self.server_id, ", ".join(lines))
+        return lines
 
-    def _delete_marker_entities(self, marker_ids: list[int]) -> int:
-        """Remove HA entities for the given marker ids; return the deleted-entity count."""
+    def _delete_marker_entities(self, ids: list[int], category: SourceCategory) -> int:
+        """Remove HA entities for the given marker/KNX ids; return the deleted-entity count."""
         registry = er.async_get(self.hass)
-        marker_entities = self.coordinator.marker_entities_by_id(marker_ids)
+        source_entities = self.coordinator.marker_entities_by_id(ids, category.unique_id_infix)
         deleted_entities = 0
-        # marker_entities is our own dict, not the live registry.entities mapping, so
+        # source_entities is our own dict, not the live registry.entities mapping, so
         # registry.async_remove() below mutating the registry doesn't affect this iteration.
-        for marker_id, entity in marker_entities.items():
+        for source_id, entity in source_entities.items():
             registry.async_remove(entity.entity_id)
             deleted_entities += 1
             _LOGGER.info(
-                "[%s] Removed entity %s for ignored marker M%d",
+                "[%s] Removed entity %s for ignored %s %s%d",
                 self.server_id,
                 entity.entity_id,
-                marker_id,
+                category.label,
+                category.audit_key_prefix,
+                source_id,
             )
         return deleted_entities
 
-    async def _delete_webio_commands(self, api: Any, dev_id: str | None, webio_cmd_ids: list[Any]) -> tuple[int, int]:
-        """Delete the given WebIO commands from dev_id; return (removed, failed) counts."""
-        webio_removed, webio_failed = 0, 0
+    async def _delete_webio_commands(
+        self, api: Any, dev_id: str | None, webio_cmd_ids: list[Any], category: SourceCategory
+    ) -> tuple[int, int]:
+        """Delete the given WebIO commands from dev_id; return (removed, failed) counts.
+
+        A missing dev_id with pending webio_cmd_ids counts as failed (not a silent (0, 0)) —
+        the commands genuinely could not be deleted, and _build_cleanup_summary_lines only
+        surfaces a warning line when webio_failed is nonzero.
+        """
         if not dev_id:
             if webio_cmd_ids:
-                _LOGGER.debug(
-                    "[%s] Skipping deletion of %d WebIO command(s) — no marker Web-IO device instance",
+                _LOGGER.warning(
+                    "[%s] Could not delete %d WebIO command(s) — no %s Web-IO device instance",
                     self.server_id,
                     len(webio_cmd_ids),
+                    category.label,
                 )
-            return webio_removed, webio_failed
+            return 0, len(webio_cmd_ids)
+        webio_removed, webio_failed = 0, 0
         for cmd_id in webio_cmd_ids:
             ok = await api.delete_single_command(cmd_id, dev_id)
             if ok:
@@ -612,15 +673,16 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
 
     @staticmethod
     def _build_cleanup_summary_lines(
-        marker_ids: list[int],
+        ids: list[int],
         deleted_entities: int,
         lp_count: int,
         webio_removed: int,
         webio_failed: int,
+        category: SourceCategory,
         has_stop_failures: bool = False,
     ) -> list[str]:
         """Build the base result lines for the cleanup-entities summary notification."""
-        ids_str = ", ".join(f"M{mid}" for mid in marker_ids)
+        ids_str = ", ".join(f"{category.audit_key_prefix}{eid}" for eid in ids)
         if (
             deleted_entities == 0
             and lp_count == 0
@@ -669,7 +731,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
 
     @staticmethod
     def _resolve_plan_webio_and_unwired(
-        api: Any, plan_data: dict, cleanup_ids: list[int]
+        api: Any, plan_data: dict, cleanup_ids: list[int], ref_type: int = 2
     ) -> tuple[list[int], list[int]]:
         """For each marker in cleanup_ids, collect its wired WebIO ids in this plan — or,
         if it has no wiring at all, its element id for direct deletion (see
@@ -682,7 +744,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         webio_ids: list[int] = []
         unwired_marker_elem_ids: list[int] = []
         for marker_id in cleanup_ids:
-            marker_elem_id = api._find_marker_element_id(plan_data.get("elements", {}), marker_id)
+            marker_elem_id = api._find_marker_element_id(plan_data.get("elements", {}), marker_id, ref_type)
             if not marker_elem_id:
                 continue
             marker_webio_ids = api._find_wired_webio_ids_for_marker(marker_id, marker_elem_id, plan_data)
@@ -714,31 +776,34 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         return result.get("deleted_elem_count", 0), stopped_plan, stop_failure
 
     async def _cleanup_function_plan_plans(
-        self, api: Any, marker_ids: list[int], lp_fub_id: int | None
+        self, api: Any, marker_ids: list[int], lp_fub_id: int | None, category: SourceCategory
     ) -> tuple[int, list[int], list[tuple[str, int]], list[tuple[str, int]]]:
-        """Run the Function Plan cleanup for every managed plan the markers are wired in.
+        """Run the Function Plan cleanup for every managed plan the markers/KNX objects are wired in.
 
         Returns (deleted element count, WebIO command ids to delete, stopped plans, stop
         failures — the latter two as (name, fub_id) tuples).
         """
-        plan_to_ids = await self.coordinator.resolve_marker_cleanup_plans(marker_ids, lp_fub_id)
+        ref_type = int(category.fub_module_type)
+        plan_to_ids = await self.coordinator.resolve_marker_cleanup_plans(marker_ids, lp_fub_id, ref_type)
         lp_count = 0
         webio_cmd_ids: list[int] = []
         stopped_plans: list[tuple[str, int]] = []
         stop_failures: list[tuple[str, int]] = []
         for fub_id, cleanup_ids in plan_to_ids.items():
             await self.coordinator.async_function_plan_change_backup(
-                fub_id, f"cleanup_ignored {[f'M{m}' for m in cleanup_ids]}"
+                fub_id, f"cleanup_ignored {[f'{category.audit_key_prefix}{m}' for m in cleanup_ids]}"
             )
-            # Resolve which WebIO commands are actually wired to these markers in this plan,
-            # then hand off to the same unwire mechanism the orphan-delete sync path uses —
+            # Resolve which WebIO commands are actually wired to these markers/KNX objects in this
+            # plan, then hand off to the same unwire mechanism the orphan-delete sync path uses —
             # it owns the webIoId -> real cmdId resolution, so callers never have to guess it
             # out of a plan element's ref_id (that field IS the webIoId, not the WebCommandId).
             plan_data = await api.function_plan_load_elements(fub_id)
             webio_ids: list[int] = []
             unwired_marker_elem_ids: list[int] = []
             if plan_data:
-                webio_ids, unwired_marker_elem_ids = self._resolve_plan_webio_and_unwired(api, plan_data, cleanup_ids)
+                webio_ids, unwired_marker_elem_ids = self._resolve_plan_webio_and_unwired(
+                    api, plan_data, cleanup_ids, ref_type
+                )
             if unwired_marker_elem_ids:
                 deleted, stopped_plan, stop_failure = await self._delete_unwired_marker_elements(
                     api, fub_id, unwired_marker_elem_ids
@@ -963,6 +1028,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             self.coordinator.data,
             webio_class=cls,
             ignored_marker_ids=self.coordinator.ignored_marker_ids,
+            ignored_knx_ids=self.coordinator.ignored_knx_ids,
         )
         success, res_id = await api.upload_web_io(self.server_id, class_name, web_io_json)
         if not success:
@@ -1142,10 +1208,10 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             resort_fub_ids.update(unwired["touched_fub_ids"])
             debris_removed += unwired["deleted_elem_count"]
 
-        # Function Plan debris (marker/IO elements whose WebIO counterpart was already
+        # Function Plan debris (marker/KNX/IO elements whose WebIO counterpart was already
         # removed elsewhere, e.g. directly in Comexio Studio) has no command to unwire —
         # just delete the leftover element(s) directly.
-        source_type = "2" if cls == WEBIO_CLASS_MARKER else "1"
+        source_type = source_category(cls).fub_module_type
         dangling_ref_ids = [i["ref_id"] for i in cls_dangling]
         if dangling_ref_ids and not getattr(self.coordinator, "cancel_sync", False):
             cleaned = await self.coordinator.delete_dangling_plan_elements(source_type, dangling_ref_ids)
@@ -1279,6 +1345,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
                         self.coordinator.data,
                         webio_class=cls,
                         ignored_marker_ids=self.coordinator.ignored_marker_ids,
+                        ignored_knx_ids=self.coordinator.ignored_knx_ids,
                     )
                 ],
             }
@@ -1331,33 +1398,43 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             f"HA IO {io['ext_name']} {io['identifier']}": (io["ext_name"], io["identifier"])
             for io in self.coordinator.data.get("io", [])
         }
-        created_marker_ids: list[int] = []
+        # Range-clustered categories (Marker + KNX): one pipeline, only the id prefix / plan
+        # label differ. IO stays a separate branch (per-extension plans, composite key).
+        clustered_cats = [cat for cat in SOURCE_CATEGORIES.values() if cat.range_clustered]
+        gap_keys = {f"{cat.key.value}_id": cat for cat in clustered_cats}
+        source_ids_by_cat: dict[WebioClass, list[int]] = {}
         created_io_refs: list[tuple[str, str]] = []
         for name in created_names:
-            if (mid := _parse_marker_id_from_webio_name(name)) is not None:
-                created_marker_ids.append(mid)
-            elif (io_ref := _parse_io_from_webio_name(name, known_io_names)) is not None:
-                created_io_refs.append(io_ref)
+            for cat in clustered_cats:
+                if (sid := _parse_source_id_from_webio_name(name, cat.audit_key_prefix)) is not None:
+                    source_ids_by_cat.setdefault(cat.key, []).append(sid)
+                    break
+            else:
+                if (io_ref := _parse_io_from_webio_name(name, known_io_names)) is not None:
+                    created_io_refs.append(io_ref)
 
         if ctx.action in {"full_sync", "function_plan_add_missing"}:
-            gap_marker_ids = [item["marker_id"] for item in gap_items if "marker_id" in item]
-            gap_io_items = [item for item in gap_items if "marker_id" not in item]
+            for item in gap_items:
+                for gap_key, cat in gap_keys.items():
+                    if gap_key in item:
+                        source_ids_by_cat.setdefault(cat.key, []).append(item[gap_key])
+            gap_io_items = [item for item in gap_items if not any(k in item for k in gap_keys)]
         else:
-            gap_marker_ids = []
             gap_io_items = []
 
-        marker_ids = list(dict.fromkeys(created_marker_ids + gap_marker_ids))
+        source_ids_by_cat = {k: list(dict.fromkeys(v)) for k, v in source_ids_by_cat.items() if v}
         io_items = _merge_io_items(created_io_refs, gap_io_items, managed_exts)
-        if not marker_ids and not io_items:
+        if not source_ids_by_cat and not io_items:
             return []
 
-        progress_state = {"done": 0, "total": len(marker_ids) + len(io_items), "t0": time.monotonic()}
+        total = sum(len(v) for v in source_ids_by_cat.values()) + len(io_items)
+        progress_state = {"done": 0, "total": total, "t0": time.monotonic()}
         summary: list[str] = []
         n_added = 0
         n_errors = 0
 
-        if marker_ids:
-            lines, added, errors = await self._wire_marker_clusters(ctx, marker_ids, progress_state)
+        for cat_key, ids in source_ids_by_cat.items():
+            lines, added, errors = await self._wire_source_clusters(ctx, source_category(cat_key), ids, progress_state)
             summary.extend(lines)
             n_added += added
             n_errors += errors
@@ -1373,9 +1450,10 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
     async def _wire_trigger_pairs(self, ctx: _SyncContext, refresh_audit: bool = False) -> list[str]:
         """Create/remove Marker+Flanke self-reset pairs for [TRIG]/[TP] markers.
 
-        Driven by the coordinator's function_plan_trigger_missing/orphan audit lists, not by
-        created_names — a trigger marker's Web-IO command is audited/created exactly like any
-        other marker's, independently of this construct (see const.py's trigger-plan notes).
+        Driven by the coordinator's function_plan_trigger_missing/orphan audit maps (per-ref_type
+        id lists, one bucket per trigger-capable source category), not by created_names — a
+        trigger source's Web-IO command is audited/created exactly like any other source's,
+        independently of this construct (see const.py's trigger-plan notes).
         refresh_audit=True re-audits against Comexio's *current* config instead of trusting
         last_audit_results — used after _sync_all_classes, since a marker renamed to add/drop
         its [TRIG]/[TP] suffix around the time this sync ran would otherwise be judged against
@@ -1389,23 +1467,30 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         if ctx.action not in {"full_sync", "function_plan_add_missing"}:
             return []
         if refresh_audit:
-            missing_ids, orphan_ids = await self.coordinator.async_fresh_trigger_audit()
+            missing_by_ref, orphan_by_ref = await self.coordinator.async_fresh_trigger_audit()
         else:
             audit_data = getattr(self.coordinator, "last_audit_results", {})
-            missing_ids = audit_data.get("function_plan_trigger_missing", [])
-            orphan_ids = audit_data.get("function_plan_trigger_orphan", [])
-        if not missing_ids and not orphan_ids:
+            missing_by_ref = audit_data.get("function_plan_trigger_missing", {})
+            orphan_by_ref = audit_data.get("function_plan_trigger_orphan", {})
+        if not missing_by_ref and not orphan_by_ref:
             return []
 
         summary: list[str] = []
-        if missing_ids:
-            summary.append(await self._add_trigger_pairs(ctx, missing_ids))
-        if orphan_ids:
-            summary.append(await self._remove_trigger_pairs(ctx, orphan_ids))
+        for ref_type, ids in missing_by_ref.items():
+            if ids:
+                summary.append(await self._add_trigger_pairs(ctx, ids, ref_type))
+        for ref_type, ids in orphan_by_ref.items():
+            if ids:
+                summary.append(await self._remove_trigger_pairs(ctx, ids, ref_type))
         return summary
 
-    async def _add_trigger_pairs(self, ctx: _SyncContext, missing_ids: list[int]) -> str:
-        """Resolve/create the trigger plan and add the missing Marker+Flanke pairs."""
+    async def _add_trigger_pairs(self, ctx: _SyncContext, missing_ids: list[int], ref_type: int = 2) -> str:
+        """Resolve/create the trigger plan and add the missing source+Flanke pairs.
+
+        ref_type is the plan-element type of the trigger source category (marker=2,
+        KNX=11 — blind guess); it selects the audit-key prefix and is threaded into the
+        API so the created element points at the right $FubModules bucket.
+        """
         api = ctx.api
         fub_id, is_fresh = await self.coordinator.resolve_trigger_plan()
         if fub_id is None:
@@ -1413,14 +1498,17 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
                 f"{ICON_WARNING} Trigger plan '{FUNCTION_PLAN_TRIGGER_PLAN_NAME}': could not resolve/create — see log."
             )
 
+        prefix = category_by_fub_module_type(ref_type).audit_key_prefix
         plan_name = self._plan_name(fub_id)
         was_active = bool(api.fub_data.get(str(fub_id), {}).get("Active", True))
         t0 = time.monotonic()
         await self.coordinator.async_function_plan_change_backup(
-            fub_id, f"add_trigger_pairs {[f'M{m}' for m in missing_ids]}"
+            fub_id, f"add_trigger_pairs {[f'{prefix}{m}' for m in missing_ids]}"
         )
         await api.function_plan_stop_fup(fub_id)
-        added, errors = await api.function_plan_add_trigger_pairs(fub_id, missing_ids, fresh_plan=is_fresh)
+        added, errors = await api.function_plan_add_trigger_pairs(
+            fub_id, missing_ids, fresh_plan=is_fresh, ref_type=ref_type
+        )
         if errors:
             _LOGGER.warning("[%s] function_plan_add_trigger_pairs errors: %s", self.server_id, errors)
         if added and not is_fresh:
@@ -1431,8 +1519,11 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             await api.function_plan_run_fup(fub_id)
         return _plan_summary_line(plan_name, is_fresh, len(added), len(missing_ids), "trigger pairs", t0, "", errors)
 
-    async def _remove_trigger_pairs(self, ctx: _SyncContext, orphan_ids: list[int]) -> str:
-        """Remove orphaned Marker+Flanke pairs from the trigger plan (marker lost its suffix).
+    async def _remove_trigger_pairs(self, ctx: _SyncContext, orphan_ids: list[int], ref_type: int = 2) -> str:
+        """Remove orphaned source+Flanke pairs from the trigger plan (source lost its suffix).
+
+        ref_type selects the trigger source category (marker=2, KNX=11 — blind guess) so the
+        audit-key prefix and the API element lookup target the right $FubModules bucket.
 
         Unlike _add_trigger_pairs (which goes through resolve_trigger_plan, verifying the
         cached fub_id's live name before trusting it), this reads CONF_FUNCTION_PLAN_PLAN_MAP
@@ -1457,22 +1548,24 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
                 f"'{FUNCTION_PLAN_TRIGGER_PLAN_NAME}' — skipped orphan cleanup to avoid touching a user-owned plan."
             )
 
+        prefix = category_by_fub_module_type(ref_type).audit_key_prefix
         await self.coordinator.async_function_plan_change_backup(
-            fub_id, f"remove_trigger_pairs {[f'M{m}' for m in orphan_ids]}"
+            fub_id, f"remove_trigger_pairs {[f'{prefix}{m}' for m in orphan_ids]}"
         )
-        deleted, plan_stopped = await ctx.api.function_plan_remove_trigger_pairs(fub_id, orphan_ids)
+        deleted, plan_stopped = await ctx.api.function_plan_remove_trigger_pairs(fub_id, orphan_ids, ref_type=ref_type)
         note = f", {ICON_WARNING} plan left stopped — please restart it in Comexio" if plan_stopped else ""
         return f"{ICON_DELETE} Removed {deleted} orphaned trigger element(s){note}"
 
-    async def _wire_marker_clusters(
-        self, ctx: _SyncContext, marker_ids: list[int], progress_state: dict
+    async def _wire_source_clusters(
+        self, ctx: _SyncContext, category: SourceCategory, source_ids: list[int], progress_state: dict
     ) -> tuple[list[str], int, int]:
-        """Resolve the marker cluster plans and add the pairs. Returns (lines, added, errors)."""
-        plan_to_ids, created_plans = await self.coordinator.resolve_marker_clusters(marker_ids)
+        """Resolve the marker/KNX cluster plans and add the pairs. Returns (lines, added, errors)."""
+        plan_to_ids, created_plans = await self.coordinator.resolve_marker_clusters(source_ids, category.label)
         if not plan_to_ids:
-            _LOGGER.warning("[%s] Cluster plan wiring: no marker cluster plan available", self.server_id)
-            return [f"{ICON_WARNING} No marker cluster plan available — see log."], 0, 1
+            _LOGGER.warning("[%s] Cluster plan wiring: no %s cluster plan available", self.server_id, category.label)
+            return [f"{ICON_WARNING} No {category.label} cluster plan available — see log."], 0, 1
 
+        ref_type = int(category.fub_module_type)
         summary: list[str] = []
         added = 0
         errors = 0
@@ -1480,7 +1573,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             if getattr(self.coordinator, "cancel_sync", False):
                 break
             line, lp_added, lp_errors = await self._add_pairs_to_plan(
-                ctx, fub_id, sorted(cluster_ids), fub_id in created_plans, progress_state
+                ctx, fub_id, sorted(cluster_ids), fub_id in created_plans, progress_state, ref_type
             )
             summary.append(line)
             added += len(lp_added)
@@ -1529,16 +1622,19 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         cluster_ids: list[int],
         is_fresh: bool,
         progress_state: dict,
+        ref_type: int = 2,
     ) -> tuple[str, list[int], list[str]]:
-        """Add marker pairs to one plan. Returns (summary_line, added_ids, errors).
+        """Add marker/KNX pairs to one plan. Returns (summary_line, added_ids, errors).
 
         Freshly created plans get their pairs at final grid positions (no sort pass)
         and are activated afterwards; existing plans are re-sorted quietly and — if
-        they were active before this run stopped them — reactivated.
+        they were active before this run stopped them — reactivated. ref_type selects
+        the source category (marker=2 / KNX=11 — blind guess).
         """
         api = ctx.api
+        category = category_by_fub_module_type(ref_type)
         plan_name = self._plan_name(fub_id)
-        if (mismatch := self._check_plan_rename_mismatch(fub_id, cluster_ids, plan_name)) is not None:
+        if (mismatch := self._check_plan_rename_mismatch(fub_id, cluster_ids, plan_name, category.label)) is not None:
             return mismatch
 
         # Capture the activation state BEFORE stop_fup: function_plan_add_marker_pairs
@@ -1552,7 +1648,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             step_info="Function Plan: adding pairs",
         )
         await self.coordinator.async_function_plan_change_backup(
-            fub_id, f"add_marker_pairs {[f'M{m}' for m in cluster_ids]}"
+            fub_id, f"add_marker_pairs {[f'{category.audit_key_prefix}{m}' for m in cluster_ids]}"
         )
         await api.function_plan_stop_fup(fub_id)
         lp_added, lp_errors = await api.function_plan_add_marker_pairs(
@@ -1560,6 +1656,7 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
             cluster_ids,
             fresh_plan=is_fresh,
             progress_cb=lambda done, total: _plan_pair_progress(ctx, progress_state, plan_name, done, total),
+            ref_type=ref_type,
         )
         progress_state["done"] += len(cluster_ids)
         if lp_errors:
@@ -1573,16 +1670,17 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         )
 
     def _check_plan_rename_mismatch(
-        self, fub_id: int, cluster_ids: list[int], plan_name: str
+        self, fub_id: int, cluster_ids: list[int], plan_name: str, category_label: str = "Marker"
     ) -> tuple[str, list[int], list[str]] | None:
         """Aborted-result tuple if the plan was renamed/repurposed since resolve_marker_clusters() ran."""
-        expected_name = self.coordinator.expected_marker_cluster_name(cluster_ids[0])
+        expected_name = self.coordinator.expected_source_cluster_name(cluster_ids[0], category_label)
         if plan_name == expected_name:
             return None
         _LOGGER.error(
-            "[%s] Aborting marker pair write to fub=%s: expected managed plan '%s' but it is now named "
+            "[%s] Aborting %s pair write to fub=%s: expected managed plan '%s' but it is now named "
             "'%s' — it was renamed/repurposed since resolve_marker_clusters() ran",
             self.server_id,
+            category_label,
             fub_id,
             expected_name,
             plan_name,
@@ -1727,15 +1825,16 @@ class ComexioSyncButton(CoordinatorEntity, ButtonEntity):
         return _plan_summary_line(plan_name, is_fresh, len(added), n_total, "IO pairs", t0, note, errors), added, errors
 
 
-def _parse_marker_id_from_webio_name(name: str) -> int | None:
-    """Extract the marker ID from a Web-IO command name like 'HA M68 Title'.
+def _parse_source_id_from_webio_name(name: str, prefix: str) -> int | None:
+    """Extract the source ID from a Web-IO command name like 'HA M68 Title' or 'HA K41 Title'.
 
-    Returns the integer marker ID, or None if the name doesn't match the marker pattern.
+    `prefix` is the category's audit-key prefix ("M" for markers, "K" for KNX — blind guess).
+    Returns the integer source ID, or None if the name doesn't match the given category's pattern.
     """
     parts = name.split()
-    if len(parts) >= 2 and parts[0] == "HA" and parts[1].upper().startswith("M"):
+    if len(parts) >= 2 and parts[0] == "HA" and parts[1].upper().startswith(prefix.upper()):
         with contextlib.suppress(ValueError):
-            return int(parts[1][1:])
+            return int(parts[1][len(prefix) :])
     return None
 
 
@@ -1775,25 +1874,37 @@ class ComexioMarkerTriggerButton(ComexioMarkerEntity, ButtonEntity):
     """
 
     async def async_press(self) -> None:
-        """Fire the trigger by writing 1 to the marker once.
+        """Fire the trigger by writing 1 to the source once.
 
-        Re-checks the marker's current kind against the coordinator's last-polled data
+        Re-checks the source's current kind against the coordinator's last-polled data
         (not the kind captured at entity creation) so a title edit that drops [TRIG]/[TP]
         or adds [RO] after this button was created can't be bypassed by a stale,
         still-registered entity. Like every other write path in this integration, this
         reads coordinator.data as of the most recent poll — it narrows the staleness
         window to at most one poll interval, it does not eliminate it.
         """
-        marker = next(
-            (mk for mk in self.coordinator.data.get("markers", []) if str(mk.get("id")) == self._marker_id),
+        data_key = SOURCE_CATEGORIES[self._SOURCE].data_key
+        source = next(
+            (s for s in self.coordinator.data.get(data_key, []) if str(s.get("id")) == self._marker_id),
             None,
         )
-        if marker is None or marker.get("kind") != MarkerKind.TRIGGER:
+        if source is None or source.get("kind") != MarkerKind.TRIGGER:
             raise HomeAssistantError(
-                f"Marker {self._marker_id} is no longer a trigger marker — reload the integration to refresh entities."
+                f"{self._source_label} {self._marker_id} is no longer a trigger "
+                f"{self._source_label} — reload the integration to refresh entities."
             )
-        if not await self.coordinator.api.set_value("marker", self._marker_id, 1):
-            raise HomeAssistantError(f"Failed to trigger marker {self._marker_id}")
+        if not await self._async_source_write(1):
+            raise HomeAssistantError(f"Failed to trigger {self._source_label} {self._marker_id}")
+
+
+class ComexioKnxTriggerButton(ComexioKnxEntity, ComexioMarkerTriggerButton):
+    """A "virtueller Taster" ([TRIG]/[TP]) Comexio KNX object as a Button (blind, see project_knx_objects memory)."""
+
+
+_TRIGGER_BUTTON_CLASSES: dict[WebioClass, type[ComexioMarkerTriggerButton]] = {
+    WEBIO_CLASS_MARKER: ComexioMarkerTriggerButton,
+    WEBIO_CLASS_KNX: ComexioKnxTriggerButton,
+}
 
 
 class ComexioCancelSyncButton(CoordinatorEntity, ButtonEntity):

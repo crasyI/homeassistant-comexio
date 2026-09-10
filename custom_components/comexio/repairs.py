@@ -30,12 +30,14 @@ from .const import (
     ICON_RENAME,
     ICON_ROCKET,
     ICON_SYNC,
+    SOURCE_CATEGORIES,
     SYNC_DURATION_DELETE,
     SYNC_DURATION_FUNCTION_PLAN_FINALIZE,
     SYNC_DURATION_FUNCTION_PLAN_PAIR,
     SYNC_DURATION_FUNCTION_PLAN_PLAN,
     SYNC_DURATION_RECREATE,
     SYNC_DURATION_WRITE,
+    WEBIO_CLASS_KNX,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,13 +46,24 @@ ACTION_FIX = "fix"
 ACTION_IGNORE = "ignore"
 
 
-def _function_plan_gap_lines(lp_missing_c: int, detail: dict) -> list[str]:
-    """Summary bullets for missing Function Plan wiring, split by marker-cluster vs. IO-
-    extension gaps.
+def _is_knx_cluster_plan(plan_name: str) -> bool:
+    """True if a cluster-plan name from detail['markers_by_plan'] is a KNX cluster plan.
 
-    A whole cluster with nothing wired (all markers of that ID range / all IOs of that
-    extension missing) reads as "cluster plan missing/not yet created" instead of a bare
-    gap count — this also covers a managed cluster plan that was deleted directly in
+    Marker and KNX cluster plans share that one dict (see
+    coordinator._function_plan_missing_detail) — their plan-name strings never collide
+    ("... - Marker [...]" vs "... - KNX [...]"), so the category is recovered from the name.
+    """
+    knx_label = SOURCE_CATEGORIES[WEBIO_CLASS_KNX].label
+    return f" - {knx_label} [" in plan_name
+
+
+def _function_plan_gap_lines(lp_missing_c: int, detail: dict) -> list[str]:
+    """Summary bullets for missing Function Plan wiring, split by marker/KNX-cluster vs.
+    IO-extension gaps.
+
+    A whole cluster with nothing wired (all markers/KNX objects of that ID range / all IOs
+    of that extension missing) reads as "cluster plan missing/not yet created" instead of a
+    bare gap count — this also covers a managed cluster plan that was deleted directly in
     Comexio. Issues created before the detail split carry no detail dict -> single legacy
     line.
     """
@@ -58,10 +71,14 @@ def _function_plan_gap_lines(lp_missing_c: int, detail: dict) -> list[str]:
         return [f"* {ICON_LINK} **Not wired in Function Plan:** {lp_missing_c}"]
     lines = []
     for plan_name, (gap, total) in detail.get("markers_by_plan", {}).items():
-        if gap == total:
-            lines.append(f"* {ICON_PUZZLE} **Marker cluster plan {plan_name} missing:** all {gap} markers")
+        if _is_knx_cluster_plan(plan_name):
+            cluster_noun, item_noun, item_noun_cap = "KNX cluster plan", "KNX objects", "KNX objects"
         else:
-            lines.append(f"* {ICON_LINK} **Markers not wired in {plan_name}:** {gap} of {total}")
+            cluster_noun, item_noun, item_noun_cap = "Marker cluster plan", "markers", "Markers"
+        if gap == total:
+            lines.append(f"* {ICON_PUZZLE} **{cluster_noun} {plan_name} missing:** all {gap} {item_noun}")
+        else:
+            lines.append(f"* {ICON_LINK} **{item_noun_cap} not wired in {plan_name}:** {gap} of {total}")
     for ext, (gap, total) in detail.get("ios_by_ext", {}).items():
         if gap == total:
             lines.append(f"* {ICON_PUZZLE} **Extension {ext} not yet in an IO cluster plan:** all {gap} IOs")
@@ -82,8 +99,10 @@ def _function_plan_option_label(lp_missing_c: int, detail: dict, eta: str) -> st
     if not markers_by_plan and not ios_by_ext:
         return f"{ICON_LINK} Wire in Function Plan ({lp_missing_c}x{eta})"
     parts = []
-    if markers := sum(gap for gap, _total in markers_by_plan.values()):
-        parts.append(f"{markers} markers")
+    if marker_gap := sum(gap for name, (gap, _total) in markers_by_plan.items() if not _is_knx_cluster_plan(name)):
+        parts.append(f"{marker_gap} markers")
+    if knx_gap := sum(gap for name, (gap, _total) in markers_by_plan.items() if _is_knx_cluster_plan(name)):
+        parts.append(f"{knx_gap} KNX objects")
     parts.extend(f"{ext} +{gap} IOs" for ext, (gap, _total) in ios_by_ext.items())
     detail_str = f"({', '.join(parts)},{eta})"
     all_whole = all(gap == total for gap, total in markers_by_plan.values()) and all(
@@ -451,7 +470,8 @@ class ComexioRepairFlow(RepairsFlow):
                 if ce_c > 0:
                     lines.append(
                         f"* {ICON_CLEANUP} "
-                        f"**{'Ignorierte Merker aufräumen' if is_de else 'Ignored marker cleanup'}:** {ce_c}"
+                        f"**{'Ignorierte Merker/KNX-Objekte aufräumen' if is_de else 'Ignored marker/KNX cleanup'}:** "
+                        f"{ce_c}"
                     )
                 if lp_missing_c > 0:
                     lines.extend(_function_plan_gap_lines(lp_missing_c, lp_detail))
@@ -532,9 +552,9 @@ class ComexioRepairFlow(RepairsFlow):
                 ce_del_t = get_time_for_count(ce_c, is_delete=True)
                 lp_eta = format_time(lp_c * SYNC_DURATION_FUNCTION_PLAN_PLAN) if lp_c > 0 else ""
                 label = (
-                    f"{ICON_CLEANUP} Ignorierte Merker aufräumen (Entitäten + Function Plan + WebIO)"
+                    f"{ICON_CLEANUP} Ignorierte Merker/KNX-Objekte aufräumen (Entitäten + Function Plan + WebIO)"
                     if is_de
-                    else f"{ICON_CLEANUP} Cleanup Ignored Markers (entities + Function Plan + WebIO)"
+                    else f"{ICON_CLEANUP} Cleanup Ignored Markers/KNX (entities + Function Plan + WebIO)"
                 )
                 specific_options["cleanup_entities"] = f"{label} ({ce_c}x{ce_del_t}{lp_eta})"
 

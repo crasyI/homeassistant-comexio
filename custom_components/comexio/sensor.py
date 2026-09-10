@@ -22,7 +22,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import CONF_INCLUDE_OFFLINE_EXTENSIONS, DOMAIN, MARKER_TYPE_INTERVAL, MarkerKind, bus_load_signal
 from .coordinator import ComexioCoordinator
-from .entity import ComexioIOEntity, ComexioMarkerEntity
+from .entity import ComexioIOEntity, ComexioKnxEntity, ComexioMarkerEntity
 
 # Mapping Comexio units to HA Device Classes
 UNIT_TO_DEVICE_CLASS = {
@@ -61,6 +61,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if marker["type"] == "analog"
             and marker.get("kind") == MarkerKind.READ_ONLY
             and int(marker["id"]) not in ignored_ids
+        )
+
+    # Read-only ("[RO]") analog KNX objects (blind implementation, see project_knx_objects memory) — opt-in, default OFF
+    if conf.get("import_knx", False):
+        ignored_knx = coordinator.ignored_knx_ids
+        entities.extend(
+            ComexioKnxSensor(coordinator, coordinator.server_id, knx)
+            for knx in coordinator.data.get("knx", [])
+            if knx["type"] == "analog" and knx.get("kind") == MarkerKind.READ_ONLY and int(knx["id"]) not in ignored_knx
         )
 
     entities.extend(
@@ -144,13 +153,17 @@ class ComexioMarkerSensor(ComexioMarkerEntity, SensorEntity):
     @property
     def native_value(self) -> float | None:
         """Return the current value from coordinator cache."""
-        val = self.coordinator.marker_states.get(self._marker_id)
+        val = self._source_value
         if val is None:
             return None
         try:
             return float(val)
         except (ValueError, TypeError):
             return None
+
+
+class ComexioKnxSensor(ComexioKnxEntity, ComexioMarkerSensor):
+    """A read-only ("[RO]") analog Comexio KNX object (blind implementation, see project_knx_objects memory)."""
 
 
 class ComexioSyncStatusSensor(CoordinatorEntity, SensorEntity):
