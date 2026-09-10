@@ -2668,6 +2668,15 @@ class ComexioCoordinator(DataUpdateCoordinator):
         # Clean up the legacy "invalid" issue if it still exists from a previous version
         ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_invalid_{self.server_id}")
 
+        # A category the user has opted out of contributes an empty final_data[data_key] by
+        # design (see _async_update_data). Running the stale-ID sweep below against that empty
+        # list would flag EVERY configured ignore-id as "no longer in Comexio" and silently wipe
+        # the user's ignore list on a mere toggle-off. The list is dormant config while the
+        # category is off — leave it untouched; the sweep resumes when it is re-enabled.
+        if webio_class not in active_webio_classes(conf):
+            ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_cleanup_{self.server_id}")
+            return
+
         ignored_raw = conf.get(conf_key, "").strip()
         if not ignored_raw:
             ir.async_delete_issue(self.hass, DOMAIN, f"{conf_key}_cleanup_{self.server_id}")
